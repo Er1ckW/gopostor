@@ -1,9 +1,6 @@
 package gateway
 
-import (
-	"fmt"
-	"net/http"
-)
+import "fmt"
 
 const (
 	routeExact   = "exact"
@@ -13,7 +10,7 @@ const (
 	routeInvalid = "invalid_version"
 )
 
-type route struct {
+type routeResult struct {
 	backend    *Backend
 	normalized int64
 	kind       string
@@ -22,11 +19,11 @@ type route struct {
 // route picks the backend for a client version. Versions outside every range go to the nearest
 // backend below them (or the oldest one), so that Impostor itself tells the player whether the game
 // or the server is outdated instead of the gateway failing with a generic error.
-func (c *Config) route(version int64) route {
+func (c *Config) route(version int64) routeResult {
 	if version < 1 || version > maxVersion {
-		return route{kind: routeInvalid}
+		return routeResult{kind: routeInvalid}
 	}
-	r := route{normalized: normalizeVersion(version)}
+	r := routeResult{normalized: normalizeVersion(version)}
 	for i := range c.Backends {
 		b := &c.Backends[i]
 		if r.normalized >= b.min && r.normalized <= b.max {
@@ -51,15 +48,15 @@ func (c *Config) route(version int64) route {
 	return r
 }
 
-// findBackend returns the backend whose range contains the version, without any fallback.
-func (c *Config) findBackend(version int64) *Backend {
+// findMatchingBackend returns the backend whose range contains the version, without any fallback.
+func (c *Config) findMatchingBackend(version int64) *Backend {
 	if r := c.route(version); r.kind == routeExact {
 		return r.backend
 	}
 	return nil
 }
 
-func (c *Config) routeHint(r route) string {
+func (c *Config) routeHint(r routeResult) string {
 	if r.kind == routeExact || r.kind == routeInvalid {
 		return ""
 	}
@@ -78,16 +75,4 @@ func (c *Config) routeHint(r route) string {
 		hint += "（rejectUnknownVersions=true：游戏请求将返回 Reason 5）"
 	}
 	return hint
-}
-
-func (g *gateway) logRoute(w http.ResponseWriter, r route) {
-	diagnostic(w, "route", r.kind)
-	if r.backend == nil {
-		return
-	}
-	logBackend(w, r.backend)
-	if r.kind != routeExact {
-		diagnostic(w, "backend_range", r.backend.rangeText())
-		issueOnce(w, "route:"+r.kind+":"+versionText(r.normalized), "version_"+r.kind, g.config.routeHint(r))
-	}
 }

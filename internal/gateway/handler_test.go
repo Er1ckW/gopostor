@@ -67,7 +67,7 @@ func TestTokenAndRouting(t *testing.T) {
 			if err = json.Unmarshal(data, &tok); err != nil {
 				t.Fatal(err)
 			}
-			if tok.Content.Puid != "用户" || tok.Content.ClientVersion != v+flag || tok.Content.ExpiresAt != "2012-12-21T00:00:00" || tok.Hash != "impostor_was_here" {
+			if tok.Content.PUID != "用户" || tok.Content.ClientVersion != v+flag || tok.Content.ExpiresAt != "2012-12-21T00:00:00" || tok.Hash != "impostor_was_here" {
 				t.Fatal(tok)
 			}
 			host := call(h, "PUT", "/api/games", "", "Bearer "+tokenText)

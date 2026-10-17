@@ -2,7 +2,6 @@ package gateway
 
 import (
 	"context"
-	"encoding/json"
 	"io"
 	"log"
 	"net/http"
@@ -92,11 +91,6 @@ func (m *healthMonitor) record(b *Backend, err error, latency time.Duration, sou
 		logEvent(event)
 		log.Printf("[INFO] 后端 %s（%s）HTTP 可达，耗时 %dms", b.Name, b.HTTPEndpoint, latency.Milliseconds())
 	}
-}
-
-func logEvent(fields map[string]any) {
-	data, _ := json.Marshal(fields)
-	log.Print(string(data))
 }
 
 func (m *healthMonitor) isDown(b *Backend) bool {

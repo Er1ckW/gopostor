@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
-	"strconv"
 	"strings"
 )
 
@@ -19,24 +17,6 @@ const (
 	reasonError            = 17
 )
 
-var gameIDPattern = regexp.MustCompile(`^-?\d+$`)
-
-// flexibleInt accepts a JSON number or a number in a string, like ASP.NET Core does for Impostor.
-func flexibleInt(raw json.RawMessage) (value int64, quoted, ok bool) {
-	s := strings.TrimSpace(string(raw))
-	if s == "" || s == "null" {
-		return 0, false, false
-	}
-	if strings.HasPrefix(s, `"`) {
-		if json.Unmarshal(raw, &s) != nil {
-			return 0, true, false
-		}
-		s, quoted = strings.TrimSpace(s), true
-	}
-	n, err := strconv.ParseInt(s, 10, 64)
-	return n, quoted, err == nil
-}
-
 func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
@@ -44,39 +24,31 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 	_ = json.NewEncoder(w).Encode(value)
 }
 
-func errorBody(byCode bool, reasons ...any) map[string]any {
+func errorBody(isGameLookup bool, reasons ...any) map[string]any {
 	list := make([]any, len(reasons))
 	for i, r := range reasons {
 		list[i] = map[string]any{"Reason": r}
 	}
 	body := map[string]any{"Errors": list}
-	if byCode {
+	if isGameLookup {
 		body["Game"] = nil
 	}
 	return body
 }
 
-func failure(w http.ResponseWriter, status, reason int, message string) {
-	diagnostic(w, "reason", reason)
-	diagnostic(w, "message", message)
+func writeErrorResponse(w http.ResponseWriter, status, reason int, message string) {
+	setLogField(w, "reason", reason)
+	setLogField(w, "message", message)
 	writeJSON(w, status, map[string]any{"Errors": []any{map[string]any{"Reason": reason, "Message": message}}})
 }
 
-// gameFailure answers with the shape the requested endpoint uses, GET /api/games/{id} also carries "Game": null.
-func gameFailure(w http.ResponseWriter, byCode bool, status, reason int, message string) {
-	diagnostic(w, "reason", reason)
-	diagnostic(w, "message", message)
-	body := errorBody(byCode, reason)
+// writeGameErrorResponse answers with the shape the requested endpoint uses, GET /api/games/{id} also carries "Game": null.
+func writeGameErrorResponse(w http.ResponseWriter, isGameLookup bool, status, reason int, message string) {
+	setLogField(w, "reason", reason)
+	setLogField(w, "message", message)
+	body := errorBody(isGameLookup, reason)
 	body["Errors"].([]any)[0].(map[string]any)["Message"] = message
 	writeJSON(w, status, body)
-}
-
-func validGameID(s string) bool {
-	if !gameIDPattern.MatchString(s) {
-		return false
-	}
-	_, err := strconv.ParseInt(s, 10, 32)
-	return err == nil
 }
 
 func decodeJSON(data []byte) (any, error) {
@@ -93,14 +65,14 @@ func decodeJSON(data []byte) (any, error) {
 	return payload, nil
 }
 
-func rewrite(path string, payload any, b *Backend, legacy bool) error {
+func rewrite(path string, payload any, b *Backend, legacyJoin bool) error {
 	switch {
-	case legacy:
+	case legacyJoin:
 		host, ok := payload.(map[string]any)
 		if !ok {
 			return fmt.Errorf("invalid host")
 		}
-		host["Ip"] = b.ip
+		host["Ip"] = b.encodedIP
 		host["Port"] = b.PublicPort
 	case path == "/api/games":
 		return rewriteList(payload, b)
@@ -140,7 +112,7 @@ func rewriteListing(value any, b *Backend) error {
 	if !ok {
 		return fmt.Errorf("invalid listing")
 	}
-	listing["IP"] = b.ip
+	listing["IP"] = b.encodedIP
 	listing["Port"] = b.PublicPort
 	return nil
 }

@@ -3,19 +3,54 @@ package gateway
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 )
 
-// send makes one request to a backend and feeds the result into the health monitor.
-func (g *gateway) send(w http.ResponseWriter, r *http.Request, b *Backend, method, target string) (*http.Response, []byte, error) {
+var errRedirect = errors.New("backend redirect refused")
+
+var errInvalidPayload = errors.New("invalid backend payload")
+
+func errorKind(err error) string {
+	if errors.Is(err, errRedirect) {
+		return "redirect_refused"
+	}
+	if errors.Is(err, errInvalidPayload) {
+		return "invalid_payload"
+	}
+	var timeout net.Error
+	if errors.As(err, &timeout) && timeout.Timeout() {
+		return "timeout"
+	}
+	var dns *net.DNSError
+	if errors.As(err, &dns) {
+		return "dns_error"
+	}
+	var op *net.OpError
+	if errors.As(err, &op) {
+		if strings.Contains(strings.ToLower(op.Err.Error()), "refused") {
+			return "connection_refused"
+		}
+		return "network_" + op.Op
+	}
+	var syntax *json.SyntaxError
+	if errors.As(err, &syntax) {
+		return "invalid_json"
+	}
+	return fmt.Sprintf("%T", err)
+}
+
+// sendBackendRequest makes one request to a backend and feeds the result into the health monitor.
+func (g *gateway) sendBackendRequest(w http.ResponseWriter, r *http.Request, b *Backend, method, target string) (*http.Response, []byte, error) {
 	start := time.Now()
-	defer func() { diagnostic(w, "backend_duration_ms", time.Since(start).Milliseconds()) }()
-	diagnostic(w, "backend_stage", "request_build")
+	defer func() { setLogField(w, "backend_duration_ms", time.Since(start).Milliseconds()) }()
+	setLogField(w, "backend_stage", "request_build")
 	req, err := http.NewRequestWithContext(r.Context(), method, b.HTTPEndpoint+target, nil)
 	if err != nil {
 		return nil, nil, err
@@ -25,19 +60,19 @@ func (g *gateway) send(w http.ResponseWriter, r *http.Request, b *Backend, metho
 		req.Header.Set("Authorization", auth)
 	}
 	req.Header.Set("X-Request-ID", w.Header().Get("X-Request-ID"))
-	diagnostic(w, "backend_stage", "request_send")
+	setLogField(w, "backend_stage", "request_send")
 	response, err := g.client.Do(req)
 	if err != nil {
 		if r.Context().Err() == nil {
 			g.health.record(b, err, time.Since(start), "request")
 		} else {
-			diagnostic(w, "client_canceled", true)
+			setLogField(w, "client_canceled", true)
 		}
 		return nil, nil, err
 	}
 	defer response.Body.Close()
-	diagnostic(w, "backend_status", response.StatusCode)
-	diagnostic(w, "backend_stage", "response_read")
+	setLogField(w, "backend_status", response.StatusCode)
+	setLogField(w, "backend_stage", "response_read")
 	data, err := io.ReadAll(io.LimitReader(response.Body, 8<<20))
 	elapsed := time.Since(start)
 	g.health.record(b, err, elapsed, "request")
@@ -50,16 +85,16 @@ func (g *gateway) send(w http.ResponseWriter, r *http.Request, b *Backend, metho
 	return response, data, nil
 }
 
-func (g *gateway) backendFailure(w http.ResponseWriter, b *Backend, byCode bool, err error) {
-	diagnostic(w, "error_kind", errorKind(err))
+func (g *gateway) backendFailure(w http.ResponseWriter, b *Backend, isGameLookup bool, err error) {
+	setLogField(w, "error_kind", errorKind(err))
 	issue(w, levelError, "backend_unavailable", backendHint(b, err, g.config.BackendTimeoutMS))
-	gameFailure(w, byCode, 502, reasonError, "Matchmaking backend unavailable")
+	writeGameErrorResponse(w, isGameLookup, 502, reasonError, "Matchmaking backend unavailable")
 }
 
-// serveCreate hands out the configured address of the backend, after checking that the backend accepts a new game.
-func (g *gateway) serveCreate(w http.ResponseWriter, r *http.Request, b *Backend) {
+// serveCreateGame hands out the configured address of the backend, after checking that the backend accepts a new game.
+func (g *gateway) serveCreateGame(w http.ResponseWriter, r *http.Request, b *Backend) {
 	if g.config.ProbeBackendOnCreate {
-		response, data, err := g.send(w, r, b, http.MethodPut, "/api/games")
+		response, data, err := g.sendBackendRequest(w, r, b, http.MethodPut, "/api/games")
 		if err == nil && (response.StatusCode < 200 || response.StatusCode >= 300) {
 			err = fmt.Errorf("%w: status %d", errInvalidPayload, response.StatusCode)
 		}
@@ -74,8 +109,8 @@ func (g *gateway) serveCreate(w http.ResponseWriter, r *http.Request, b *Backend
 		if err != nil {
 			if response != nil {
 				issue(w, levelError, "backend_rejected_create", fmt.Sprintf("后端 %s 对创建房间返回 HTTP %d 或无效内容，玩家无法创建房间：检查后端日志", b.Name, response.StatusCode))
-				diagnostic(w, "error_kind", errorKind(err))
-				gameFailure(w, false, 502, reasonError, "Matchmaking backend unavailable")
+				setLogField(w, "error_kind", errorKind(err))
+				writeGameErrorResponse(w, false, 502, reasonError, "Matchmaking backend unavailable")
 				return
 			}
 			g.backendFailure(w, b, false, err)
@@ -85,8 +120,8 @@ func (g *gateway) serveCreate(w http.ResponseWriter, r *http.Request, b *Backend
 	} else if g.health.isDown(b) {
 		issue(w, levelWarn, "backend_marked_down", fmt.Sprintf("后端 %s 最近一次检查不可达，但 probeBackendOnCreate=false，仍返回其地址；玩家可能在连接 UDP 时超时", b.Name))
 	}
-	diagnostic(w, "response_source", "gateway")
-	writeJSON(w, 200, map[string]any{"Ip": b.ip, "Port": b.PublicPort})
+	setLogField(w, "response_source", "gateway")
+	writeJSON(w, 200, map[string]any{"Ip": b.encodedIP, "Port": b.PublicPort})
 }
 
 // checkReportedAddress compares the PublicIp/PublicPort a backend reports with the gateway configuration.
@@ -97,48 +132,48 @@ func (g *gateway) checkReportedAddress(w http.ResponseWriter, b *Backend, ip, po
 		return
 	}
 	address := fmt.Sprintf("%d.%d.%d.%d", reportedIP&0xff, reportedIP>>8&0xff, reportedIP>>16&0xff, reportedIP>>24&0xff)
-	diagnostic(w, "backend_reported_address", fmt.Sprintf("%s:%d", address, reportedPort))
-	if uint32(reportedIP) == b.ip && int(reportedPort) == b.PublicPort {
+	setLogField(w, "backend_reported_address", fmt.Sprintf("%s:%d", address, reportedPort))
+	if uint32(reportedIP) == b.encodedIP && int(reportedPort) == b.PublicPort {
 		return
 	}
-	issueOnce(w, fmt.Sprintf("address:%s:%s:%d", b.Name, address, reportedPort), "backend_public_address_mismatch",
+	warnOnceThenInfo(w, fmt.Sprintf("address:%s:%s:%d", b.Name, address, reportedPort), "backend_public_address_mismatch",
 		fmt.Sprintf("后端 %s 自报的公网地址 %s:%d 与网关 config.json 的 %s:%d 不一致；网关始终返回自己的配置，请确认玩家实际能用 %s:%d 连到这个后端的 UDP，并让两边保持一致",
 			b.Name, address, reportedPort, b.PublicIP, b.PublicPort, b.PublicIP, b.PublicPort))
 }
 
-func (g *gateway) proxy(w http.ResponseWriter, r *http.Request, b *Backend, legacy, byCode bool) {
+func (g *gateway) proxy(w http.ResponseWriter, r *http.Request, b *Backend, legacyJoin, isGameLookup bool) {
 	target := r.URL.EscapedPath()
 	if r.URL.RawQuery != "" {
 		target += "?" + r.URL.RawQuery
 	}
-	response, data, err := g.send(w, r, b, r.Method, target)
+	response, data, err := g.sendBackendRequest(w, r, b, r.Method, target)
 	if err != nil {
-		g.backendFailure(w, b, byCode, err)
+		g.backendFailure(w, b, isGameLookup, err)
 		return
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		g.backendError(w, r, b, response.StatusCode, data, legacy, byCode)
+		g.backendError(w, r, b, response.StatusCode, data, legacyJoin, isGameLookup)
 		return
 	}
 	payload, err := decodeJSON(data)
 	if err == nil {
-		diagnostic(w, "backend_stage", "response_rewrite")
-		err = rewrite(r.URL.Path, payload, b, legacy)
+		setLogField(w, "backend_stage", "response_rewrite")
+		err = rewrite(r.URL.Path, payload, b, legacyJoin)
 	}
 	if err != nil {
-		g.backendFailure(w, b, byCode, fmt.Errorf("%w: %v", errInvalidPayload, err))
+		g.backendFailure(w, b, isGameLookup, fmt.Errorf("%w: %v", errInvalidPayload, err))
 		return
 	}
-	diagnostic(w, "backend_stage", "complete")
-	diagnostic(w, "response_source", "backend")
+	setLogField(w, "backend_stage", "complete")
+	setLogField(w, "response_source", "backend")
 	writeJSON(w, 200, payload)
 }
 
 // backendError answers a non-success backend response. Only the error reasons are passed on: Impostor puts
 // exception text into Message. Endpoints an older backend does not have are answered by the gateway.
-func (g *gateway) backendError(w http.ResponseWriter, r *http.Request, b *Backend, status int, data []byte, legacy, byCode bool) {
-	diagnostic(w, "backend_stage", "http_error")
-	diagnostic(w, "backend_body_bytes", len(data))
+func (g *gateway) backendError(w http.ResponseWriter, r *http.Request, b *Backend, status int, data []byte, legacyJoin, isGameLookup bool) {
+	setLogField(w, "backend_stage", "http_error")
+	setLogField(w, "backend_body_bytes", len(data))
 	var reasons []any
 	var messages []string
 	if payload, err := decodeJSON(data); err == nil {
@@ -156,30 +191,30 @@ func (g *gateway) backendError(w http.ResponseWriter, r *http.Request, b *Backen
 		}
 	}
 	if len(reasons) > 0 {
-		diagnostic(w, "backend_reasons", reasons)
+		setLogField(w, "backend_reasons", reasons)
 		if len(messages) > 0 {
-			diagnostic(w, "backend_message", strings.Join(messages, " | "))
+			setLogField(w, "backend_message", strings.Join(messages, " | "))
 		}
 		if status == 404 && len(reasons) == 1 && reasons[0] == json.Number(strconv.Itoa(reasonGameNotFound)) {
 			issue(w, levelInfo, "game_not_found", fmt.Sprintf("后端 %s 上没有这个房间：房间已关闭、房间码输错，或房主属于另一个版本范围的后端", b.Name))
 		} else {
 			issue(w, levelWarn, "backend_error", fmt.Sprintf("后端 %s 返回 HTTP %d（Reason %v）：%s", b.Name, status, reasons, strings.Join(messages, " | ")))
 		}
-		diagnostic(w, "response_source", "backend")
-		writeJSON(w, status, errorBody(byCode, reasons...))
+		setLogField(w, "response_source", "backend")
+		writeJSON(w, status, errorBody(isGameLookup, reasons...))
 		return
 	}
 	// ASP.NET answers a route it does not have with an empty 404/405, an HTML page means something else answered.
 	if status == 404 || status == 405 {
-		body, code, known := missingEndpointAnswer(r.URL.Path, legacy, byCode)
+		body, code, known := missingEndpointAnswer(r.URL.Path, legacyJoin, isGameLookup)
 		if known || len(bytes.TrimSpace(data)) == 0 {
 			hint := fmt.Sprintf("后端 %s 没有 %s %s 接口（Impostor 1.9.x 不支持 16.0 及之后客户端使用的接口），网关已代为返回空结果或房间不存在", b.Name, r.Method, endpointName(r.URL.Path))
 			if !known {
-				body, code = errorBody(byCode, reasonError), status
+				body, code = errorBody(isGameLookup, reasonError), status
 				hint = fmt.Sprintf("后端 %s 没有 %s %s 接口（Impostor 1.9.3 和 1.10.9 都没有实现它），网关照旧返回 404（Reason 17），与之前的版本行为相同", b.Name, r.Method, endpointName(r.URL.Path))
 			}
-			issueOnce(w, "missing:"+b.Name+":"+r.Method+":"+endpointName(r.URL.Path), "backend_endpoint_missing", hint)
-			diagnostic(w, "response_source", "gateway")
+			warnOnceThenInfo(w, "missing:"+b.Name+":"+r.Method+":"+endpointName(r.URL.Path), "backend_endpoint_missing", hint)
+			setLogField(w, "response_source", "gateway")
 			writeJSON(w, code, body)
 			return
 		}
@@ -188,7 +223,7 @@ func (g *gateway) backendError(w http.ResponseWriter, r *http.Request, b *Backen
 	if status < 400 {
 		status = 502
 	}
-	writeJSON(w, status, errorBody(byCode, reasonError))
+	writeJSON(w, status, errorBody(isGameLookup, reasonError))
 }
 
 func endpointName(path string) string {
@@ -198,11 +233,11 @@ func endpointName(path string) string {
 	return path
 }
 
-func missingEndpointAnswer(path string, legacy, byCode bool) (any, int, bool) {
+func missingEndpointAnswer(path string, legacyJoin, isGameLookup bool) (any, int, bool) {
 	switch {
-	case byCode:
+	case isGameLookup:
 		return errorBody(true, reasonGameNotFound), 404, true
-	case legacy:
+	case legacyJoin:
 		return errorBody(false, reasonGameNotFound), 404, true
 	case path == "/api/games":
 		return []any{}, 200, true

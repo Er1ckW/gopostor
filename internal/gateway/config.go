@@ -20,7 +20,7 @@ type Backend struct {
 	PublicPort   int    `json:"publicPort"`
 	HTTPEndpoint string `json:"httpEndpoint"`
 	min, max     int64
-	ip           uint32
+	encodedIP    uint32
 	addr         netip.Addr
 }
 
@@ -83,7 +83,7 @@ func parseConfig(data []byte) (Config, error) {
 		}
 		b.addr = ip
 		octets := ip.As4()
-		b.ip = binary.LittleEndian.Uint32(octets[:])
+		b.encodedIP = binary.LittleEndian.Uint32(octets[:])
 		u, err := url.Parse(b.HTTPEndpoint)
 		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" || u.User != nil || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
 			return c, fmt.Errorf("%s: httpEndpoint must be an HTTP(S) origin", b.Name)

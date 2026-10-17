@@ -28,7 +28,7 @@ func TestReleaseRanges(t *testing.T) {
 				t.Fatal(err)
 			}
 			for _, flag := range []int64{0, 25} {
-				b := c.findBackend(n + flag)
+				b := c.findMatchingBackend(n + flag)
 				if b == nil || b.Name != release {
 					t.Fatalf("wrong route for %s: %v", release, bound)
 				}
@@ -37,13 +37,13 @@ func TestReleaseRanges(t *testing.T) {
 	}
 	for _, s := range []string{"2023.10.2", "2024.2.2", "2025.1.1"} {
 		v, _ := encodeVersion(s)
-		if c.findBackend(v) == nil {
+		if c.findMatchingBackend(v) == nil {
 			t.Fatal("range gap rejected")
 		}
 	}
 	for _, s := range []string{"2023.9.30", "2024.2.4", "2026.7.22"} {
 		v, _ := encodeVersion(s)
-		if c.findBackend(v) != nil {
+		if c.findMatchingBackend(v) != nil {
 			t.Fatal("outside range accepted")
 		}
 	}
@@ -79,7 +79,7 @@ func TestReleaseCompatibility(t *testing.T) {
 				t.Fatal(err)
 			}
 			for _, flag := range []int64{0, 25} {
-				b := c.findBackend(n + flag)
+				b := c.findMatchingBackend(n + flag)
 				if b == nil || b.Name != release {
 					t.Fatalf("wrong route: %v", v)
 				}
@@ -136,7 +136,7 @@ func TestConfigValidation(t *testing.T) {
 		}
 	}
 	c := testConfig(t, "http://localhost:23001")
-	if c.Backends[1].ip != 16777343 {
+	if c.Backends[1].encodedIP != 16777343 {
 		t.Fatal("incorrect IPv4 byte order")
 	}
 	data, err := os.ReadFile(exampleConfigPath)

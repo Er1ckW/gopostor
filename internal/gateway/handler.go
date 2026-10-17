@@ -3,9 +3,13 @@ package gateway
 import (
 	"io"
 	"net/http"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
+
+var gameIDPattern = regexp.MustCompile(`^-?\d+$`)
 
 type gateway struct {
 	config *Config
@@ -48,54 +52,62 @@ func (g *gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	allowed := "GET"
-	byCode := false
+	isGameLookup := false
 	switch {
 	case path == "/api/games":
 		allowed = "GET, POST, PUT"
 	case path == "/api/games/filtered" || path == "/api/filters" || path == "/api/filtertags":
 	case strings.HasPrefix(path, "/api/games/") && !strings.Contains(strings.TrimPrefix(path, "/api/games/"), "/") && strings.TrimPrefix(path, "/api/games/") != "":
-		byCode = true
+		isGameLookup = true
 		if !validGameID(strings.TrimPrefix(path, "/api/games/")) {
 			issue(w, levelInfo, "invalid_game_id", "")
-			gameFailure(w, true, 400, reasonGameNotFound, "Invalid game ID")
+			writeGameErrorResponse(w, true, 400, reasonGameNotFound, "Invalid game ID")
 			return
 		}
 	default:
 		issue(w, levelInfo, "unknown_endpoint", "")
-		failure(w, 404, reasonError, "Unknown endpoint")
+		writeErrorResponse(w, 404, reasonError, "Unknown endpoint")
 		return
 	}
 	if !strings.Contains(", "+allowed+", ", ", "+r.Method+", ") {
 		issue(w, levelInfo, "method_not_allowed", "")
 		w.Header().Set("Allow", allowed)
-		failure(w, 405, reasonError, "Method not allowed")
+		writeErrorResponse(w, 405, reasonError, "Method not allowed")
 		return
 	}
-	legacy := path == "/api/games" && r.Method == "POST"
-	if legacy && !validGameID(r.URL.Query().Get("gameId")) {
+	legacyJoin := path == "/api/games" && r.Method == "POST"
+	if legacyJoin && !validGameID(r.URL.Query().Get("gameId")) {
 		issue(w, levelInfo, "invalid_game_id", "")
-		failure(w, 400, reasonGameNotFound, "Invalid game ID")
+		writeErrorResponse(w, 400, reasonGameNotFound, "Invalid game ID")
 		return
 	}
-	version, problem, err := tokenVersion(r.Header.Get("Authorization"))
+	version, problem, err := parseTokenVersion(r.Header.Get("Authorization"))
 	if err != nil {
-		diagnostic(w, "validation_error", "invalid_matchmaking_token")
-		diagnostic(w, "token_problem", problem)
+		setLogField(w, "validation_error", "invalid_matchmaking_token")
+		setLogField(w, "token_problem", problem)
 		issue(w, levelWarn, "invalid_token", tokenHint(problem))
-		gameFailure(w, byCode, 401, reasonNotAuthorized, "Missing or invalid matchmaking token")
+		writeGameErrorResponse(w, isGameLookup, 401, reasonNotAuthorized, "Missing or invalid matchmaking token")
 		return
 	}
 	logVersion(w, version)
 	rt := g.config.route(version)
 	g.logRoute(w, rt)
 	if rt.kind != routeExact && g.config.RejectUnknownVersions {
-		gameFailure(w, byCode, 404, reasonIncorrectVersion, "Unsupported client version")
+		writeGameErrorResponse(w, isGameLookup, 404, reasonIncorrectVersion, "Unsupported client version")
 		return
 	}
 	b := rt.backend
 	if path == "/api/games" && r.Method == "PUT" {
-		g.serveCreate(w, r, b)
+		g.serveCreateGame(w, r, b)
 		return
 	}
-	g.proxy(w, r, b, legacy, byCode)
+	g.proxy(w, r, b, legacyJoin, isGameLookup)
+}
+
+func validGameID(s string) bool {
+	if !gameIDPattern.MatchString(s) {
+		return false
+	}
+	_, err := strconv.ParseInt(s, 10, 32)
+	return err == nil
 }

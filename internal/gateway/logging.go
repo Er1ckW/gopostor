@@ -2,7 +2,6 @@ package gateway
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -15,6 +14,7 @@ import (
 )
 
 var requestSequence atomic.Uint64
+
 var requestEpoch = time.Now().UnixNano()
 
 const (
@@ -62,7 +62,7 @@ func (w *requestLog) Write(p []byte) (int, error) {
 
 func (w *requestLog) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
-func diagnostic(w http.ResponseWriter, key string, value any) {
+func setLogField(w http.ResponseWriter, key string, value any) {
 	if rw, ok := w.(*requestLog); ok {
 		rw.fields[key] = value
 	}
@@ -98,8 +98,8 @@ func firstTime(key string) bool {
 	return !seen
 }
 
-// issueOnce reports a repeating problem as a warning the first time and as info afterwards.
-func issueOnce(w http.ResponseWriter, key, code, hint string) {
+// warnOnceThenInfo reports a repeating problem as a warning the first time and as info afterwards.
+func warnOnceThenInfo(w http.ResponseWriter, key, code, hint string) {
 	if firstTime(key) {
 		issue(w, levelWarn, code, hint+"（同类问题之后只记为 info）")
 		return
@@ -111,38 +111,6 @@ func quiet(w http.ResponseWriter) {
 	if rw, ok := w.(*requestLog); ok {
 		rw.quiet = true
 	}
-}
-
-var errRedirect = errors.New("backend redirect refused")
-var errInvalidPayload = errors.New("invalid backend payload")
-
-func errorKind(err error) string {
-	if errors.Is(err, errRedirect) {
-		return "redirect_refused"
-	}
-	if errors.Is(err, errInvalidPayload) {
-		return "invalid_payload"
-	}
-	var timeout net.Error
-	if errors.As(err, &timeout) && timeout.Timeout() {
-		return "timeout"
-	}
-	var dns *net.DNSError
-	if errors.As(err, &dns) {
-		return "dns_error"
-	}
-	var op *net.OpError
-	if errors.As(err, &op) {
-		if strings.Contains(strings.ToLower(op.Err.Error()), "refused") {
-			return "connection_refused"
-		}
-		return "network_" + op.Op
-	}
-	var syntax *json.SyntaxError
-	if errors.As(err, &syntax) {
-		return "invalid_json"
-	}
-	return fmt.Sprintf("%T", err)
 }
 
 func backendHint(b *Backend, err error, timeoutMS int) string {
@@ -250,19 +218,36 @@ func logRequests(next http.Handler) http.Handler {
 }
 
 func logVersion(w http.ResponseWriter, version int64) {
-	diagnostic(w, "client_version", version)
-	diagnostic(w, "normalized_version", normalizeVersion(version))
+	setLogField(w, "client_version", version)
+	setLogField(w, "normalized_version", normalizeVersion(version))
 	if version >= minRawVersion && version <= maxVersion {
-		diagnostic(w, "client_version_text", formatVersion(normalizeVersion(version)))
+		setLogField(w, "client_version_text", formatVersion(normalizeVersion(version)))
 		if normalizeVersion(version) != version {
-			diagnostic(w, "disable_server_authority_flag", true)
+			setLogField(w, "disable_server_authority_flag", true)
 		}
 	}
 }
 
 func logBackend(w http.ResponseWriter, b *Backend) {
-	diagnostic(w, "backend", b.Name)
-	diagnostic(w, "backend_endpoint", b.HTTPEndpoint)
-	diagnostic(w, "public_ip", b.PublicIP)
-	diagnostic(w, "public_port", b.PublicPort)
+	setLogField(w, "backend", b.Name)
+	setLogField(w, "backend_endpoint", b.HTTPEndpoint)
+	setLogField(w, "public_ip", b.PublicIP)
+	setLogField(w, "public_port", b.PublicPort)
+}
+
+func (g *gateway) logRoute(w http.ResponseWriter, r routeResult) {
+	setLogField(w, "route", r.kind)
+	if r.backend == nil {
+		return
+	}
+	logBackend(w, r.backend)
+	if r.kind != routeExact {
+		setLogField(w, "backend_range", r.backend.rangeText())
+		warnOnceThenInfo(w, "route:"+r.kind+":"+versionText(r.normalized), "version_"+r.kind, g.config.routeHint(r))
+	}
+}
+
+func logEvent(fields map[string]any) {
+	data, _ := json.Marshal(fields)
+	log.Print(string(data))
 }

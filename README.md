@@ -47,13 +47,13 @@ ARM64 服务器将 GOARCH 改为 arm64。上传对应架构的二进制文件。
 │   ├── app.go                   # 启动、后台任务和优雅退出
 │   ├── config.go                # 配置加载、校验和提示
 │   ├── version.go               # 协议版本解析、编码和标志处理
-│   ├── routing.go               # 后端版本路由和路由日志
-│   ├── handler.go               # HTTP 请求分发
-│   ├── token.go                 # token 签发、解析和 /api/user
-│   ├── proxy.go                 # 后端请求、创建探测和错误兼容
-│   ├── protocol.go              # JSON 响应、房间码校验和地址改写
+│   ├── routing.go               # 后端版本选择和路由结果说明
+│   ├── handler.go               # HTTP 请求分发和房间码校验
+│   ├── token.go                 # token 签发、解析、字段读取和 /api/user
+│   ├── proxy.go                 # 后端请求、创建探测、错误分类和兼容处理
+│   ├── response.go              # JSON 响应、错误响应和公网地址改写
 │   ├── health.go                # 后端健康检查和状态
-│   ├── logging.go               # 请求日志和诊断提示
+│   ├── logging.go               # 请求/事件日志、路由日志和诊断提示
 │   ├── stats.go                 # 请求汇总统计
 │   └── *_test.go                # 同包测试
 └── deploy/
@@ -210,7 +210,7 @@ go test ./...
 go vet ./...
 ```
 
-默认测试可在单独克隆的本仓库中运行，读取提交的 `config.example.json`，不依赖本地实际配置或外部 Impostor 源码。测试包含本地模拟后端、token 往返与宽松字段、各版本范围与回退路由、+25 标志、负数房间码、地址改写、创建探测、后端错误清理、1.9.x 缺失接口、健康检查、日志字段与隐私、错误和超时。
+默认测试可在单独克隆的本仓库中运行，读取提交的 `config.example.json`，不依赖本地实际配置或外部 Impostor 源码。测试包含本地模拟后端、token 原始 JSON 格式与往返、宽松字段、各版本范围与回退路由、+25 标志、负数房间码、地址改写、创建探测、后端错误清理、1.9.x 缺失接口、健康检查、日志字段与隐私、错误和超时。
 
 如需额外核对 Impostor 的支持名单，设置环境变量 `IMPOSTOR_SOURCE_ROOT`，指向同时包含 `Impostor-1.9.3/` 和 `Impostor-1.10.9/` 的目录。测试会读取其中的 `src/Impostor.Server/Net/Manager/CompatibilityManager.cs`。未设置该变量时只跳过 `TestReleaseCompatibility`；设置后源码缺失或核对不一致都会使测试失败。
 

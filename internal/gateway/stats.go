@@ -1,7 +1,6 @@
 package gateway
 
 import (
-	"encoding/json"
 	"fmt"
 	"log"
 	"sort"
@@ -19,8 +18,6 @@ type statsCollector struct {
 	issues   map[string]int
 	versions map[string]int
 }
-
-var stats = newStats()
 
 func newStats() *statsCollector {
 	return &statsCollector{status: map[string]int{}, backends: map[string]int{}, issues: map[string]int{}, versions: map[string]int{}}
@@ -70,11 +67,10 @@ func (s *statsCollector) flush(window time.Duration) {
 	if total == 0 {
 		return
 	}
-	data, _ := json.Marshal(map[string]any{
+	logEvent(map[string]any{
 		"event": "stats", "window_sec": int(window.Seconds()), "requests": total,
 		"status": status, "backends": backends, "issues": issues, "token_versions": versions,
 	})
-	log.Print(string(data))
 	log.Printf("[STATS] 最近 %s：请求 %d（%s）；后端 %s；登录版本 %s；问题 %s", window, total,
 		topCounts(status, 5), topCounts(backends, 5), topCounts(versions, 8), topCounts(issues, 8))
 }

@@ -1,7 +1,15 @@
 package main
 
-import "gopostor/internal/gateway"
+import (
+	"log"
+	"os"
+
+	"gopostor/internal/gateway"
+)
 
 func main() {
-	gateway.Run()
+	if err := gateway.Run(); err != nil {
+		log.Printf("[ERROR] %v", err)
+		os.Exit(1)
+	}
 }

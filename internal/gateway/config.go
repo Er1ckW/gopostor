@@ -1,9 +1,11 @@
 package gateway
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/netip"
 	"net/url"
 	"os"
@@ -25,6 +27,9 @@ type Backend struct {
 }
 
 type Config struct {
+	// Source is optional documentation for where the version ranges came from.
+	// It is accepted so configurations copied from older examples keep working.
+	Source           string `json:"source,omitempty"`
 	ListenIP         string `json:"listenIp"`
 	ListenPort       int    `json:"listenPort"`
 	BackendTimeoutMS int    `json:"backendTimeoutMs"`
@@ -51,11 +56,27 @@ func (b *Backend) rangeText() string {
 
 func parseConfig(data []byte) (Config, error) {
 	c := Config{ListenIP: "127.0.0.1", ListenPort: 24000, BackendTimeoutMS: 5000, ProbeBackendOnCreate: true, HealthCheckIntervalSec: 30, StatsIntervalSec: 600}
-	if err := json.Unmarshal(data, &c); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&c); err != nil {
 		return c, err
 	}
-	if strings.TrimSpace(c.ListenIP) == "" || c.ListenPort < 1 || c.ListenPort > 65535 || c.BackendTimeoutMS < 1 || c.BackendTimeoutMS > 120000 || len(c.Backends) == 0 {
-		return c, fmt.Errorf("invalid listen address, timeout or empty backends")
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return c, fmt.Errorf("unexpected trailing JSON")
+	}
+	c.ListenIP = strings.TrimSpace(c.ListenIP)
+	if c.ListenIP == "" {
+		return c, fmt.Errorf("listenIp must not be empty")
+	}
+	if c.ListenPort < 1 || c.ListenPort > 65535 {
+		return c, fmt.Errorf("listenPort must be between 1 and 65535")
+	}
+	if c.BackendTimeoutMS < 1 || c.BackendTimeoutMS > 120000 {
+		return c, fmt.Errorf("backendTimeoutMs must be between 1 and 120000")
+	}
+	if len(c.Backends) == 0 {
+		return c, fmt.Errorf("at least one backend is required")
 	}
 	if c.HealthCheckIntervalSec < 0 || c.StatsIntervalSec < 0 {
 		return c, fmt.Errorf("healthCheckIntervalSec and statsIntervalSec must not be negative")
@@ -63,7 +84,8 @@ func parseConfig(data []byte) (Config, error) {
 	names := map[string]bool{}
 	for i := range c.Backends {
 		b := &c.Backends[i]
-		if strings.TrimSpace(b.Name) == "" || names[b.Name] {
+		b.Name = strings.TrimSpace(b.Name)
+		if b.Name == "" || names[b.Name] {
 			return c, fmt.Errorf("empty or duplicate backend name: %q", b.Name)
 		}
 		names[b.Name] = true
@@ -77,6 +99,7 @@ func parseConfig(data []byte) (Config, error) {
 		if b.min > b.max || b.PublicPort < 1 || b.PublicPort > 65535 {
 			return c, fmt.Errorf("%s: invalid range or port", b.Name)
 		}
+		b.PublicIP = strings.TrimSpace(b.PublicIP)
 		ip, err := netip.ParseAddr(b.PublicIP)
 		if err != nil || !ip.Is4() {
 			return c, fmt.Errorf("%s: publicIp must be IPv4", b.Name)
@@ -84,6 +107,7 @@ func parseConfig(data []byte) (Config, error) {
 		b.addr = ip
 		octets := ip.As4()
 		b.encodedIP = binary.LittleEndian.Uint32(octets[:])
+		b.HTTPEndpoint = strings.TrimSpace(b.HTTPEndpoint)
 		u, err := url.Parse(b.HTTPEndpoint)
 		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" || u.User != nil || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
 			return c, fmt.Errorf("%s: httpEndpoint must be an HTTP(S) origin", b.Name)
@@ -120,17 +144,17 @@ func (c *Config) review() (warnings, notes []string) {
 		b := &c.Backends[i]
 		switch {
 		case b.addr.IsLoopback() || b.addr.IsUnspecified():
-			warnings = append(warnings, fmt.Sprintf("后端 %s 的 publicIp=%s 是回环/未指定地址，只有本机客户端能连上 UDP；正式部署请改成服务器公网 IPv4", b.Name, b.PublicIP))
+			warnings = append(warnings, hintConfigLoopback(b))
 		case b.addr.IsPrivate():
-			warnings = append(warnings, fmt.Sprintf("后端 %s 的 publicIp=%s 是内网地址，外网玩家创建/加入房间后会连接超时；仅局域网部署时可忽略", b.Name, b.PublicIP))
+			warnings = append(warnings, hintConfigPrivate(b))
 		}
 		if i > 0 && b.min > c.Backends[i-1].max+1 {
-			notes = append(notes, fmt.Sprintf("版本 %s 与 %s 之间没有后端：落在间隙内的客户端将转给 %s%s", formatVersion(c.Backends[i-1].max), formatVersion(b.min), c.Backends[i-1].Name, c.rejectNote()))
+			notes = append(notes, hintConfigGap(c, i))
 		}
 	}
 	last := &c.Backends[len(c.Backends)-1]
 	if last.max != maxVersion {
-		text := fmt.Sprintf("最高版本上限为 %s：Among Us 更新后的新客户端将转给 %s%s；可以把最后一个后端的 maxVersion 留空表示不设上限", formatVersion(last.max), last.Name, c.rejectNote())
+		text := hintConfigMax(c, last)
 		if c.RejectUnknownVersions {
 			warnings = append(warnings, text)
 		} else {
@@ -138,11 +162,4 @@ func (c *Config) review() (warnings, notes []string) {
 		}
 	}
 	return warnings, notes
-}
-
-func (c *Config) rejectNote() string {
-	if c.RejectUnknownVersions {
-		return "，但 rejectUnknownVersions=true，其游戏请求会被拒绝（Reason 5）"
-	}
-	return "，由该后端在 UDP 握手时判断版本"
 }

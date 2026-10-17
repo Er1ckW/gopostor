@@ -68,6 +68,9 @@ func TestDiagnosticLogs(t *testing.T) {
 		if record[tc.field] != tc.value {
 			t.Fatalf("%s: %v", tc.field, record)
 		}
+		if record["time"] == nil {
+			t.Fatal("missing time field")
+		}
 		id := w.Header().Get("X-Request-ID")
 		if id == "" || ids[id] || record["request_id"] != id {
 			t.Fatal("request ID mismatch")
@@ -84,8 +87,9 @@ func TestDiagnosticLogs(t *testing.T) {
 
 func TestReadableProblemLines(t *testing.T) {
 	output := captureLog(t)
-	shownOnce.Range(func(key, _ any) bool { shownOnce.Delete(key); return true })
-	h := newHandler(testConfig(t, "http://127.0.0.1:1"))
+	g := newGateway(testConfig(t, "http://127.0.0.1:1"))
+	g.shownOnce.Range(func(key, _ any) bool { g.shownOnce.Delete(key); return true })
+	h := g.handler()
 	call(h, "PUT", "/api/games", "", "Bearer "+createToken("x", 50663600))
 	text := output.String()
 	for _, want := range []string{`"level":"error"`, `"issues":["backend_unavailable"]`, "[ERROR] 后端 new 不可达", "PUT /api/games -> 502 backend_unavailable", "HttpServer.Enabled"} {
@@ -116,8 +120,9 @@ func TestReadableProblemLines(t *testing.T) {
 
 func TestQuietHealthzAndStats(t *testing.T) {
 	output := captureLog(t)
-	h := newHandler(testConfig(t, "http://127.0.0.1:1"))
-	stats.flush(time.Minute)
+	g := newGateway(testConfig(t, "http://127.0.0.1:1"))
+	h := g.handler()
+	g.stats.flush(time.Minute)
 	output.Reset()
 	call(h, "GET", "/healthz", "", "")
 	if output.Len() != 0 {
@@ -125,12 +130,12 @@ func TestQuietHealthzAndStats(t *testing.T) {
 	}
 	call(h, "POST", "/api/user", `{"Puid":"x","ClientVersion":50595550}`, "")
 	output.Reset()
-	stats.flush(time.Minute)
+	g.stats.flush(time.Minute)
 	if !strings.Contains(output.String(), `"event":"stats"`) || !strings.Contains(output.String(), "2023.11.15×1") {
 		t.Fatal(output.String())
 	}
 	output.Reset()
-	stats.flush(time.Minute)
+	g.stats.flush(time.Minute)
 	if output.Len() != 0 {
 		t.Fatal("empty window was logged")
 	}

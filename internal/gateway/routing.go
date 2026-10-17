@@ -1,7 +1,5 @@
 package gateway
 
-import "fmt"
-
 const (
 	routeExact   = "exact"
 	routeBelow   = "below_range"
@@ -20,7 +18,7 @@ type routeResult struct {
 // backend below them (or the oldest one), so that Impostor itself tells the player whether the game
 // or the server is outdated instead of the gateway failing with a generic error.
 func (c *Config) route(version int64) routeResult {
-	if version < 1 || version > maxVersion {
+	if len(c.Backends) == 0 || version < 1 || version > maxVersion {
 		return routeResult{kind: routeInvalid}
 	}
 	r := routeResult{normalized: normalizeVersion(version)}
@@ -46,33 +44,4 @@ func (c *Config) route(version int64) routeResult {
 		}
 	}
 	return r
-}
-
-// findMatchingBackend returns the backend whose range contains the version, without any fallback.
-func (c *Config) findMatchingBackend(version int64) *Backend {
-	if r := c.route(version); r.kind == routeExact {
-		return r.backend
-	}
-	return nil
-}
-
-func (c *Config) routeHint(r routeResult) string {
-	if r.kind == routeExact || r.kind == routeInvalid {
-		return ""
-	}
-	v := versionText(r.normalized)
-	first, last := &c.Backends[0], &c.Backends[len(c.Backends)-1]
-	var hint string
-	switch r.kind {
-	case routeBelow:
-		hint = fmt.Sprintf("客户端版本 %s 低于所有已配置范围（最低 %s），已转给 %s，玩家连接时会被后端提示更新游戏；如需支持该版本，请部署对应版本的 Impostor 并在 config.json 中添加范围", v, formatVersion(first.min), r.backend.Name)
-	case routeAbove:
-		hint = fmt.Sprintf("客户端版本 %s 高于所有已配置范围（最高 %s），可能是 Among Us 刚更新，已转给最新后端 %s；若该后端不支持此版本，玩家会看到服务器版本过旧。请升级后端，并把 maxVersion 调大或留空", v, formatVersion(last.max), r.backend.Name)
-	case routeBetween:
-		hint = fmt.Sprintf("客户端版本 %s 落在两个后端范围之间，已转给 %s；请确认该版本应由哪个后端处理并调整范围", v, r.backend.Name)
-	}
-	if c.RejectUnknownVersions {
-		hint += "（rejectUnknownVersions=true：游戏请求将返回 Reason 5）"
-	}
-	return hint
 }

@@ -57,9 +57,11 @@ func (m *healthMonitor) record(b *Backend, err error, latency time.Duration, sou
 	now := time.Now()
 	previous, downFor := s.State, now.Sub(s.Since).Round(time.Second)
 	s.LastCheck, s.LatencyMS = now, latency.Milliseconds()
+	var kind failureKind
 	if err != nil {
+		kind = classifyError(err)
 		s.Failures++
-		s.LastError = errorKind(err)
+		s.LastError = string(kind)
 		if previous != stateDown {
 			s.State, s.Since = stateDown, now
 		}
@@ -69,7 +71,7 @@ func (m *healthMonitor) record(b *Backend, err error, latency time.Duration, sou
 			s.State, s.Since = stateUp, now
 		}
 	}
-	failures, kind := s.Failures, s.LastError
+	failures := s.Failures
 	m.mu.Unlock()
 
 	event := map[string]any{"event": "backend_health", "backend": b.Name, "backend_endpoint": b.HTTPEndpoint, "source": source, "latency_ms": latency.Milliseconds()}
@@ -77,7 +79,7 @@ func (m *healthMonitor) record(b *Backend, err error, latency time.Duration, sou
 	case err != nil && previous != stateDown:
 		event["level"], event["state"], event["error_kind"] = "error", stateDown, kind
 		logEvent(event)
-		log.Printf("[ERROR] 后端 %s 不可达（%s，来源 %s）：%s。在恢复前，分配到该后端的创建/加入房间都会失败", b.Name, kind, source, backendHint(b, err, m.timeoutMS))
+		log.Printf("[ERROR] 后端 %s 不可达（%s，来源 %s）：%s。在恢复前，分配到该后端的创建/加入房间都会失败", b.Name, kind, source, hintBackendUnavailable(b, err, m.timeoutMS))
 	case err != nil && failures%20 == 0:
 		event["level"], event["state"], event["error_kind"], event["consecutive_failures"] = "error", stateDown, kind, failures
 		logEvent(event)

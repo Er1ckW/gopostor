@@ -6,29 +6,38 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
 var gameIDPattern = regexp.MustCompile(`^-?\d+$`)
 
 type gateway struct {
-	config *Config
-	client *http.Client
-	health *healthMonitor
+	config       *Config
+	client       *http.Client
+	health       *healthMonitor
+	stats        *statsCollector
+	shownOnce    sync.Map
+	requestEpoch int64
+	requestSeq   atomic.Uint64
 }
 
 func newGateway(c Config) *gateway {
 	client := &http.Client{Timeout: time.Duration(c.BackendTimeoutMS) * time.Millisecond, CheckRedirect: func(*http.Request, []*http.Request) error { return errRedirect }}
-	g := &gateway{config: &c, client: client}
+	g := &gateway{
+		config:       &c,
+		client:       client,
+		stats:        newStats(),
+		requestEpoch: time.Now().UnixNano(),
+	}
 	g.health = newHealthMonitor(g.config, client)
 	return g
 }
 
-func newHandler(c Config) http.Handler { return newGateway(c).handler() }
+func (g *gateway) handler() http.Handler { return g.logRequests() }
 
-func (g *gateway) handler() http.Handler { return logRequests(g) }
-
-func (g *gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (g *gateway) serve(w *requestLog, r *http.Request) {
 	path := r.URL.Path
 	isRead := r.Method == http.MethodGet || r.Method == http.MethodHead
 	if path == "/" && isRead {
@@ -42,7 +51,7 @@ func (g *gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		status := http.StatusOK
 		if !healthy {
 			status = http.StatusServiceUnavailable
-			issue(w, levelWarn, "healthz_backend_down", "健康检查报告有后端不可达，详见启动后的 [ERROR] 后端 ... 不可达 日志")
+			issue(w, levelWarn, "healthz_backend_down", hintHealthzBackendDown())
 		}
 		writeJSON(w, status, map[string]any{"healthy": healthy, "backends": states})
 		return
@@ -85,7 +94,7 @@ func (g *gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		setLogField(w, "validation_error", "invalid_matchmaking_token")
 		setLogField(w, "token_problem", problem)
-		issue(w, levelWarn, "invalid_token", tokenHint(problem))
+		issue(w, levelWarn, "invalid_token", hintTokenProblem(problem))
 		writeGameErrorResponse(w, isGameLookup, 401, reasonNotAuthorized, "Missing or invalid matchmaking token")
 		return
 	}

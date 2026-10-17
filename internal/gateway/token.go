@@ -13,17 +13,20 @@ import (
 
 type tokenContent struct {
 	PUID          string `json:"Puid"`
-	ClientVersion int64
-	ExpiresAt     string
+	ClientVersion int64  `json:"ClientVersion"`
+	ExpiresAt     string `json:"ExpiresAt"`
 }
 
 type token struct {
-	Content tokenContent
-	Hash    string
+	Content tokenContent `json:"Content"`
+	Hash    string       `json:"Hash"`
 }
 
 func createToken(puid string, version int64) string {
-	data, _ := json.Marshal(token{tokenContent{puid, version, "2012-12-21T00:00:00"}, "impostor_was_here"})
+	data, _ := json.Marshal(token{
+		Content: tokenContent{PUID: puid, ClientVersion: version, ExpiresAt: "2012-12-21T00:00:00"},
+		Hash:    "impostor_was_here",
+	})
 	return base64.StdEncoding.EncodeToString(data)
 }
 
@@ -72,18 +75,7 @@ func flexibleInt(raw json.RawMessage) (value int64, quoted, ok bool) {
 	return n, quoted, err == nil
 }
 
-func tokenHint(problem string) string {
-	switch problem {
-	case "missing_authorization":
-		return "请求没有 Authorization 头：Nginx 可能未转发它（需要 proxy_set_header Authorization $http_authorization），或客户端没有先成功调用 /api/user"
-	case "invalid_client_version":
-		return "token 中没有有效的 ClientVersion：token 不是 Impostor/本网关签发的"
-	default:
-		return "token 格式不是 Impostor/本网关签发的 Base64 JSON：客户端可能沿用了官方服务器或其他私服的 token，让玩家重启游戏后重新选择该区域"
-	}
-}
-
-func (g *gateway) serveToken(w http.ResponseWriter, r *http.Request) {
+func (g *gateway) serveToken(w *requestLog, r *http.Request) {
 	if r.Method != "POST" {
 		issue(w, levelInfo, "method_not_allowed", "")
 		w.Header().Set("Allow", "POST")
@@ -99,14 +91,14 @@ func (g *gateway) serveToken(w http.ResponseWriter, r *http.Request) {
 	data, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 65536))
 	if err != nil {
 		setLogField(w, "validation_error", "request_body_read_failed")
-		setLogField(w, "error_kind", errorKind(err))
-		issue(w, levelWarn, "token_request_unreadable", "读取 /api/user 请求体失败或超过 64KB：客户端中途断开，或代理截断了请求")
+		setLogField(w, "error_kind", classifyError(err))
+		issue(w, levelWarn, "token_request_unreadable", hintTokenRequestUnreadable())
 		writeErrorResponse(w, 400, reasonError, "Invalid token request")
 		return
 	}
 	if err = json.Unmarshal(data, &user); err != nil {
 		setLogField(w, "validation_error", "invalid_json_or_field_type")
-		setLogField(w, "error_kind", errorKind(err))
+		setLogField(w, "error_kind", classifyError(err))
 		// Report only known schema field names, never raw JSON or values.
 		if fieldError, ok := err.(*json.UnmarshalTypeError); ok {
 			switch fieldError.Field {
@@ -114,7 +106,7 @@ func (g *gateway) serveToken(w http.ResponseWriter, r *http.Request) {
 				setLogField(w, "invalid_field", fieldError.Field)
 			}
 		}
-		issue(w, levelWarn, "token_request_invalid_json", "/api/user 请求体不是预期的 JSON：确认请求来自 Among Us 客户端，且 Nginx 没有改写请求体")
+		issue(w, levelWarn, "token_request_invalid_json", hintTokenRequestInvalidJSON())
 		writeErrorResponse(w, 400, reasonError, "Invalid token request")
 		return
 	}
@@ -125,7 +117,7 @@ func (g *gateway) serveToken(w http.ResponseWriter, r *http.Request) {
 	if !ok || version < 1 || version > maxVersion {
 		setLogField(w, "validation_error", "missing_or_invalid_client_version")
 		setLogField(w, "invalid_fields", []string{"ClientVersion"})
-		issue(w, levelWarn, "token_request_invalid_version", "/api/user 缺少有效的 ClientVersion，无法确定后端：请求很可能不是来自 Among Us 客户端")
+		issue(w, levelWarn, "token_request_invalid_version", hintTokenRequestInvalidVersion())
 		writeErrorResponse(w, 400, reasonError, "Invalid token request")
 		return
 	}
@@ -146,7 +138,7 @@ func (g *gateway) serveToken(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(missing) > 0 {
 		setLogField(w, "missing_fields", missing)
-		issue(w, levelInfo, "token_fields_missing", "缺少 "+strings.Join(missing, "/")+"，通常是旧版客户端或无名称账号；网关照常签发 token")
+		issue(w, levelInfo, "token_fields_missing", hintTokenFieldsMissing(missing))
 	}
 	puid := ""
 	if user.PUID != nil {

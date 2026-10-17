@@ -13,6 +13,9 @@ import (
 	"time"
 )
 
+// newHandler is the test seam for a fully wired gateway: logging, stats and health included.
+func newHandler(c Config) http.Handler { return newGateway(c).handler() }
+
 func testConfig(t *testing.T, endpoint string) Config {
 	t.Helper()
 	c, err := parseConfig([]byte(fmt.Sprintf(`{"backends":[{"name":"old","minVersion":"2023.10.1","maxVersion":"2024.2.3","publicIp":"203.0.113.10","publicPort":22031,"httpEndpoint":%q},{"name":"new","minVersion":"2024.3.1","maxVersion":"2026.7.21","publicIp":"127.0.0.1","publicPort":22032,"httpEndpoint":%q}]}`, endpoint, endpoint)))

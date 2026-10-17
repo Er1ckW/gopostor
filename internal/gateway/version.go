@@ -7,10 +7,19 @@ import (
 	"strings"
 )
 
-const maxVersion = 2147483647
+const (
+	// Protocol versions are encoded as year*25000 + month*1800 + day*50 + revision.
+	yearFactor  = 25000
+	monthFactor = 1800
+	dayFactor   = 50
+	// The client may set +25 to disable server authority; routing ignores that flag.
+	authorityFlag = 25
 
-// minRawVersion rejects raw integers that cannot be a real client version (2000.1.1).
-const minRawVersion = 2000*25000 + 1800 + 50
+	maxVersion = 2147483647
+
+	// minRawVersion rejects raw integers that cannot be a real client version (2000.1.1).
+	minRawVersion = 2000*yearFactor + monthFactor + dayFactor
+)
 
 var versionPattern = regexp.MustCompile(`^(\d+)\.(\d+)\.(\d+)(?:\.(\d+))?$`)
 
@@ -30,7 +39,7 @@ func encodeVersion(s string) (int64, error) {
 		}
 		v[i] = n
 	}
-	n := v[0]*25000 + v[1]*1800 + v[2]*50 + v[3]
+	n := v[0]*yearFactor + v[1]*monthFactor + v[2]*dayFactor + v[3]
 	if v[0] < 1 || v[0] > 85899 || v[1] < 1 || v[1] > 12 || v[2] < 1 || v[2] > 31 || v[3] > 24 || n > maxVersion {
 		return 0, fmt.Errorf("invalid protocol version: %q", s)
 	}
@@ -53,9 +62,9 @@ func parseVersionBound(s string, empty int64) (int64, error) {
 }
 
 func formatVersion(n int64) string {
-	year, rest := n/25000, n%25000
-	month, rest := rest/1800, rest%1800
-	day, revision := rest/50, rest%50
+	year, rest := n/yearFactor, n%yearFactor
+	month, rest := rest/monthFactor, rest%monthFactor
+	day, revision := rest/dayFactor, rest%dayFactor
 	if revision == 0 {
 		return fmt.Sprintf("%d.%d.%d", year, month, day)
 	}
@@ -71,8 +80,8 @@ func versionText(n int64) string {
 }
 
 func normalizeVersion(version int64) int64 {
-	if version%50 >= 25 {
-		return version - 25
+	if version%dayFactor >= authorityFlag {
+		return version - authorityFlag
 	}
 	return version
 }

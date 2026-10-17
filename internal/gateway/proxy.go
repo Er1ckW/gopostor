@@ -17,37 +17,51 @@ var errRedirect = errors.New("backend redirect refused")
 
 var errInvalidPayload = errors.New("invalid backend payload")
 
-func errorKind(err error) string {
+// failureKind classifies why a backend request failed. It is a distinct type so
+// hints and logs cannot silently disagree about a string constant.
+type failureKind string
+
+const (
+	kindRedirect          failureKind = "redirect_refused"
+	kindInvalidPayload    failureKind = "invalid_payload"
+	kindTimeout           failureKind = "timeout"
+	kindDNS               failureKind = "dns_error"
+	kindConnectionRefused failureKind = "connection_refused"
+	kindNetworkDial       failureKind = "network_dial"
+	kindInvalidJSON       failureKind = "invalid_json"
+)
+
+func classifyError(err error) failureKind {
 	if errors.Is(err, errRedirect) {
-		return "redirect_refused"
+		return kindRedirect
 	}
 	if errors.Is(err, errInvalidPayload) {
-		return "invalid_payload"
+		return kindInvalidPayload
 	}
 	var timeout net.Error
 	if errors.As(err, &timeout) && timeout.Timeout() {
-		return "timeout"
+		return kindTimeout
 	}
 	var dns *net.DNSError
 	if errors.As(err, &dns) {
-		return "dns_error"
+		return kindDNS
 	}
 	var op *net.OpError
 	if errors.As(err, &op) {
 		if strings.Contains(strings.ToLower(op.Err.Error()), "refused") {
-			return "connection_refused"
+			return kindConnectionRefused
 		}
-		return "network_" + op.Op
+		return failureKind("network_" + op.Op)
 	}
 	var syntax *json.SyntaxError
 	if errors.As(err, &syntax) {
-		return "invalid_json"
+		return kindInvalidJSON
 	}
-	return fmt.Sprintf("%T", err)
+	return failureKind(fmt.Sprintf("%T", err))
 }
 
 // sendBackendRequest makes one request to a backend and feeds the result into the health monitor.
-func (g *gateway) sendBackendRequest(w http.ResponseWriter, r *http.Request, b *Backend, method, target string) (*http.Response, []byte, error) {
+func (g *gateway) sendBackendRequest(w *requestLog, r *http.Request, b *Backend, method, target string) (*http.Response, []byte, error) {
 	start := time.Now()
 	defer func() { setLogField(w, "backend_duration_ms", time.Since(start).Milliseconds()) }()
 	setLogField(w, "backend_stage", "request_build")
@@ -80,19 +94,19 @@ func (g *gateway) sendBackendRequest(w http.ResponseWriter, r *http.Request, b *
 		return nil, nil, err
 	}
 	if limit := time.Duration(g.config.BackendTimeoutMS) * time.Millisecond / 2; elapsed > limit {
-		issue(w, levelWarn, "backend_slow", fmt.Sprintf("后端 %s 用时 %dms，超过超时时间 %dms 的一半；持续出现时检查后端负载和网络", b.Name, elapsed.Milliseconds(), g.config.BackendTimeoutMS))
+		issue(w, levelWarn, "backend_slow", hintBackendSlow(b, elapsed, g.config.BackendTimeoutMS))
 	}
 	return response, data, nil
 }
 
-func (g *gateway) backendFailure(w http.ResponseWriter, b *Backend, isGameLookup bool, err error) {
-	setLogField(w, "error_kind", errorKind(err))
-	issue(w, levelError, "backend_unavailable", backendHint(b, err, g.config.BackendTimeoutMS))
+func (g *gateway) backendFailure(w *requestLog, b *Backend, isGameLookup bool, err error) {
+	setLogField(w, "error_kind", classifyError(err))
+	issue(w, levelError, "backend_unavailable", hintBackendUnavailable(b, err, g.config.BackendTimeoutMS))
 	writeGameErrorResponse(w, isGameLookup, 502, reasonError, "Matchmaking backend unavailable")
 }
 
 // serveCreateGame hands out the configured address of the backend, after checking that the backend accepts a new game.
-func (g *gateway) serveCreateGame(w http.ResponseWriter, r *http.Request, b *Backend) {
+func (g *gateway) serveCreateGame(w *requestLog, r *http.Request, b *Backend) {
 	if g.config.ProbeBackendOnCreate {
 		response, data, err := g.sendBackendRequest(w, r, b, http.MethodPut, "/api/games")
 		if err == nil && (response.StatusCode < 200 || response.StatusCode >= 300) {
@@ -108,8 +122,8 @@ func (g *gateway) serveCreateGame(w http.ResponseWriter, r *http.Request, b *Bac
 		}
 		if err != nil {
 			if response != nil {
-				issue(w, levelError, "backend_rejected_create", fmt.Sprintf("后端 %s 对创建房间返回 HTTP %d 或无效内容，玩家无法创建房间：检查后端日志", b.Name, response.StatusCode))
-				setLogField(w, "error_kind", errorKind(err))
+				issue(w, levelError, "backend_rejected_create", hintBackendRejectedCreate(b, response.StatusCode))
+				setLogField(w, "error_kind", classifyError(err))
 				writeGameErrorResponse(w, false, 502, reasonError, "Matchmaking backend unavailable")
 				return
 			}
@@ -118,14 +132,14 @@ func (g *gateway) serveCreateGame(w http.ResponseWriter, r *http.Request, b *Bac
 		}
 		g.checkReportedAddress(w, b, host.Ip, host.Port)
 	} else if g.health.isDown(b) {
-		issue(w, levelWarn, "backend_marked_down", fmt.Sprintf("后端 %s 最近一次检查不可达，但 probeBackendOnCreate=false，仍返回其地址；玩家可能在连接 UDP 时超时", b.Name))
+		issue(w, levelWarn, "backend_marked_down", hintBackendMarkedDown(b))
 	}
 	setLogField(w, "response_source", "gateway")
 	writeJSON(w, 200, map[string]any{"Ip": b.encodedIP, "Port": b.PublicPort})
 }
 
 // checkReportedAddress compares the PublicIp/PublicPort a backend reports with the gateway configuration.
-func (g *gateway) checkReportedAddress(w http.ResponseWriter, b *Backend, ip, port json.Number) {
+func (g *gateway) checkReportedAddress(w *requestLog, b *Backend, ip, port json.Number) {
 	reportedIP, ipErr := ip.Int64()
 	reportedPort, portErr := port.Int64()
 	if ipErr != nil || portErr != nil {
@@ -136,12 +150,11 @@ func (g *gateway) checkReportedAddress(w http.ResponseWriter, b *Backend, ip, po
 	if uint32(reportedIP) == b.encodedIP && int(reportedPort) == b.PublicPort {
 		return
 	}
-	warnOnceThenInfo(w, fmt.Sprintf("address:%s:%s:%d", b.Name, address, reportedPort), "backend_public_address_mismatch",
-		fmt.Sprintf("后端 %s 自报的公网地址 %s:%d 与网关 config.json 的 %s:%d 不一致；网关始终返回自己的配置，请确认玩家实际能用 %s:%d 连到这个后端的 UDP，并让两边保持一致",
-			b.Name, address, reportedPort, b.PublicIP, b.PublicPort, b.PublicIP, b.PublicPort))
+	g.warnOnceThenInfo(w, fmt.Sprintf("address:%s:%s:%d", b.Name, address, reportedPort), "backend_public_address_mismatch",
+		hintBackendAddressMismatch(b, address, reportedPort))
 }
 
-func (g *gateway) proxy(w http.ResponseWriter, r *http.Request, b *Backend, legacyJoin, isGameLookup bool) {
+func (g *gateway) proxy(w *requestLog, r *http.Request, b *Backend, legacyJoin, isGameLookup bool) {
 	target := r.URL.EscapedPath()
 	if r.URL.RawQuery != "" {
 		target += "?" + r.URL.RawQuery
@@ -171,34 +184,19 @@ func (g *gateway) proxy(w http.ResponseWriter, r *http.Request, b *Backend, lega
 
 // backendError answers a non-success backend response. Only the error reasons are passed on: Impostor puts
 // exception text into Message. Endpoints an older backend does not have are answered by the gateway.
-func (g *gateway) backendError(w http.ResponseWriter, r *http.Request, b *Backend, status int, data []byte, legacyJoin, isGameLookup bool) {
+func (g *gateway) backendError(w *requestLog, r *http.Request, b *Backend, status int, data []byte, legacyJoin, isGameLookup bool) {
 	setLogField(w, "backend_stage", "http_error")
 	setLogField(w, "backend_body_bytes", len(data))
-	var reasons []any
-	var messages []string
-	if payload, err := decodeJSON(data); err == nil {
-		if object, ok := payload.(map[string]any); ok {
-			list, _ := object["Errors"].([]any)
-			for _, item := range list {
-				entry, _ := item.(map[string]any)
-				if reason, ok := entry["Reason"].(json.Number); ok {
-					reasons = append(reasons, reason)
-				}
-				if message, ok := entry["Message"].(string); ok && message != "" {
-					messages = append(messages, truncate(message, 160))
-				}
-			}
-		}
-	}
+	reasons, messages := parseBackendErrors(data)
 	if len(reasons) > 0 {
 		setLogField(w, "backend_reasons", reasons)
 		if len(messages) > 0 {
 			setLogField(w, "backend_message", strings.Join(messages, " | "))
 		}
 		if status == 404 && len(reasons) == 1 && reasons[0] == json.Number(strconv.Itoa(reasonGameNotFound)) {
-			issue(w, levelInfo, "game_not_found", fmt.Sprintf("后端 %s 上没有这个房间：房间已关闭、房间码输错，或房主属于另一个版本范围的后端", b.Name))
+			issue(w, levelInfo, "game_not_found", hintGameNotFound(b))
 		} else {
-			issue(w, levelWarn, "backend_error", fmt.Sprintf("后端 %s 返回 HTTP %d（Reason %v）：%s", b.Name, status, reasons, strings.Join(messages, " | ")))
+			issue(w, levelWarn, "backend_error", hintBackendError(b, status, reasons, messages))
 		}
 		setLogField(w, "response_source", "backend")
 		writeJSON(w, status, errorBody(isGameLookup, reasons...))
@@ -206,24 +204,47 @@ func (g *gateway) backendError(w http.ResponseWriter, r *http.Request, b *Backen
 	}
 	// ASP.NET answers a route it does not have with an empty 404/405, an HTML page means something else answered.
 	if status == 404 || status == 405 {
+		endpoint := endpointName(r.URL.Path)
 		body, code, known := missingEndpointAnswer(r.URL.Path, legacyJoin, isGameLookup)
 		if known || len(bytes.TrimSpace(data)) == 0 {
-			hint := fmt.Sprintf("后端 %s 没有 %s %s 接口（Impostor 1.9.x 不支持 16.0 及之后客户端使用的接口），网关已代为返回空结果或房间不存在", b.Name, r.Method, endpointName(r.URL.Path))
 			if !known {
 				body, code = errorBody(isGameLookup, reasonError), status
-				hint = fmt.Sprintf("后端 %s 没有 %s %s 接口（Impostor 1.9.3 和 1.10.9 都没有实现它），网关照旧返回 404（Reason 17），与之前的版本行为相同", b.Name, r.Method, endpointName(r.URL.Path))
 			}
-			warnOnceThenInfo(w, "missing:"+b.Name+":"+r.Method+":"+endpointName(r.URL.Path), "backend_endpoint_missing", hint)
+			g.warnOnceThenInfo(w, "missing:"+b.Name+":"+r.Method+":"+endpoint, "backend_endpoint_missing", hintMissingEndpoint(b, r.Method, endpoint, known))
 			setLogField(w, "response_source", "gateway")
 			writeJSON(w, code, body)
 			return
 		}
 	}
-	issue(w, levelError, "backend_error_unparsed", fmt.Sprintf("后端 %s 返回 HTTP %d，响应不是 Impostor 的错误格式（%d 字节）：可能是后端异常，或 httpEndpoint 指向了 Nginx/其他服务", b.Name, status, len(data)))
+	issue(w, levelError, "backend_error_unparsed", hintBackendErrorUnparsed(b, status, len(data)))
 	if status < 400 {
 		status = 502
 	}
 	writeJSON(w, status, errorBody(isGameLookup, reasonError))
+}
+
+// parseBackendErrors extracts only the fields the gateway forwards and logs: Reason values and
+// the first line of Message, which is never sent to the client.
+func parseBackendErrors(data []byte) (reasons []any, messages []string) {
+	payload, err := decodeJSON(data)
+	if err != nil {
+		return nil, nil
+	}
+	object, ok := payload.(map[string]any)
+	if !ok {
+		return nil, nil
+	}
+	list, _ := object["Errors"].([]any)
+	for _, item := range list {
+		entry, _ := item.(map[string]any)
+		if reason, ok := entry["Reason"].(json.Number); ok {
+			reasons = append(reasons, reason)
+		}
+		if message, ok := entry["Message"].(string); ok && message != "" {
+			messages = append(messages, truncate(message, 160))
+		}
+	}
+	return reasons, messages
 }
 
 func endpointName(path string) string {

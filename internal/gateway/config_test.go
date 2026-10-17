@@ -10,6 +10,15 @@ import (
 
 const exampleConfigPath = "../../config.example.json"
 
+// findMatchingBackend returns the backend whose range contains the version, without the
+// out-of-range fallback. Tests use it to assert range boundaries.
+func (c *Config) findMatchingBackend(version int64) *Backend {
+	if r := c.route(version); r.kind == routeExact {
+		return r.backend
+	}
+	return nil
+}
+
 func TestReleaseRanges(t *testing.T) {
 	c, err := loadConfig(exampleConfigPath)
 	if err != nil {
@@ -111,6 +120,9 @@ func TestOpenRangesAndFallback(t *testing.T) {
 	if r := c.route(0); r.backend != nil || r.kind != routeInvalid {
 		t.Fatal(r)
 	}
+	if r := (&Config{}).route(1); r.backend != nil || r.kind != routeInvalid {
+		t.Fatal("empty config must not panic or route")
+	}
 	warnings, notes := c.review()
 	if len(warnings) != 0 || len(notes) != 1 || !strings.Contains(notes[0], "2024.2.3") {
 		t.Fatal(warnings, notes)
@@ -121,6 +133,35 @@ func TestOpenRangesAndFallback(t *testing.T) {
 	}
 	if warnings, _ := loaded.review(); len(warnings) != 2 {
 		t.Fatal("loopback publicIp should warn", warnings)
+	}
+}
+
+func TestConfigRejectsUnknownFields(t *testing.T) {
+	valid := `{"backends":[{"name":"a","minVersion":"2023.10.1","maxVersion":"2024.2.3","publicIp":"203.0.113.1","publicPort":22031,"httpEndpoint":"http://127.0.0.1:23001"}]}`
+	if _, err := parseConfig([]byte(valid)); err != nil {
+		t.Fatal(err)
+	}
+	for _, body := range []string{
+		strings.Replace(valid, `"backends"`, `"backendTimeoutMillis":1000,"backends"`, 1),
+		strings.Replace(valid, `"name":"a"`, `"name":"a","unknown":1`, 1),
+		valid + `{}`,
+	} {
+		if _, err := parseConfig([]byte(body)); err == nil {
+			t.Fatalf("accepted invalid config: %s", body)
+		}
+	}
+}
+
+func BenchmarkRoute(b *testing.B) {
+	c, err := loadConfig(exampleConfigPath)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if r := c.route(50663600); r.backend == nil {
+			b.Fatal("no backend")
+		}
 	}
 }
 

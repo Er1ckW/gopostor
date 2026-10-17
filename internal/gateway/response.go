@@ -36,18 +36,20 @@ func errorBody(isGameLookup bool, reasons ...any) map[string]any {
 	return body
 }
 
-func writeErrorResponse(w http.ResponseWriter, status, reason int, message string) {
+func writeErrorResponse(w *requestLog, status, reason int, message string) {
 	setLogField(w, "reason", reason)
 	setLogField(w, "message", message)
 	writeJSON(w, status, map[string]any{"Errors": []any{map[string]any{"Reason": reason, "Message": message}}})
 }
 
 // writeGameErrorResponse answers with the shape the requested endpoint uses, GET /api/games/{id} also carries "Game": null.
-func writeGameErrorResponse(w http.ResponseWriter, isGameLookup bool, status, reason int, message string) {
+func writeGameErrorResponse(w *requestLog, isGameLookup bool, status, reason int, message string) {
 	setLogField(w, "reason", reason)
 	setLogField(w, "message", message)
-	body := errorBody(isGameLookup, reason)
-	body["Errors"].([]any)[0].(map[string]any)["Message"] = message
+	body := map[string]any{"Errors": []any{map[string]any{"Reason": reason, "Message": message}}}
+	if isGameLookup {
+		body["Game"] = nil
+	}
 	writeJSON(w, status, body)
 }
 

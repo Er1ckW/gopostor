@@ -8,14 +8,8 @@ import (
 	"net/http"
 	"net/netip"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"time"
 )
-
-var requestSequence atomic.Uint64
-
-var requestEpoch = time.Now().UnixNano()
 
 const (
 	levelInfo = iota
@@ -55,80 +49,52 @@ func (w *requestLog) Write(p []byte) (int, error) {
 	n, err := w.ResponseWriter.Write(p)
 	w.bytes += n
 	if err != nil {
-		w.fields["write_error"] = errorKind(err)
+		w.fields["write_error"] = classifyError(err)
 	}
 	return n, err
 }
 
 func (w *requestLog) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
-func setLogField(w http.ResponseWriter, key string, value any) {
-	if rw, ok := w.(*requestLog); ok {
-		rw.fields[key] = value
-	}
+func setLogField(w *requestLog, key string, value any) {
+	w.fields[key] = value
 }
 
 // issue records a named problem of the request together with a hint telling the operator what to check.
 // Warnings and errors are additionally printed as one readable line next to the JSON record.
-func issue(w http.ResponseWriter, level int, code, hint string) {
-	rw, ok := w.(*requestLog)
-	if !ok {
-		return
+func issue(w *requestLog, level int, code, hint string) {
+	if !w.leveled || level > w.level {
+		w.level = level
 	}
-	if !rw.leveled || level > rw.level {
-		rw.level = level
-	}
-	rw.leveled = true
-	rw.issues = append(rw.issues, code)
+	w.leveled = true
+	w.issues = append(w.issues, code)
 	if level >= levelWarn {
-		rw.serious = append(rw.serious, code)
+		w.serious = append(w.serious, code)
 	}
 	if hint != "" {
-		rw.hints = append(rw.hints, hint)
+		w.hints = append(w.hints, hint)
 		if level >= levelWarn {
-			rw.seriousHints = append(rw.seriousHints, hint)
+			w.seriousHints = append(w.seriousHints, hint)
 		}
 	}
 }
 
-var shownOnce sync.Map
-
-func firstTime(key string) bool {
-	_, seen := shownOnce.LoadOrStore(key, true)
+func (g *gateway) firstTime(key string) bool {
+	_, seen := g.shownOnce.LoadOrStore(key, true)
 	return !seen
 }
 
 // warnOnceThenInfo reports a repeating problem as a warning the first time and as info afterwards.
-func warnOnceThenInfo(w http.ResponseWriter, key, code, hint string) {
-	if firstTime(key) {
-		issue(w, levelWarn, code, hint+"（同类问题之后只记为 info）")
+func (g *gateway) warnOnceThenInfo(w *requestLog, key, code, hint string) {
+	if g.firstTime(key) {
+		issue(w, levelWarn, code, hint+warnOnceNote)
 		return
 	}
 	issue(w, levelInfo, code, hint)
 }
 
-func quiet(w http.ResponseWriter) {
-	if rw, ok := w.(*requestLog); ok {
-		rw.quiet = true
-	}
-}
-
-func backendHint(b *Backend, err error, timeoutMS int) string {
-	prefix := fmt.Sprintf("后端 %s（%s）", b.Name, b.HTTPEndpoint)
-	switch kind := errorKind(err); {
-	case kind == "connection_refused" || kind == "network_dial":
-		return prefix + " 拒绝连接：检查 Impostor 是否在运行、config.json 的 HttpServer.Enabled 是否为 true、HttpServer.ListenIp/ListenPort 是否与 httpEndpoint 一致"
-	case kind == "timeout":
-		return fmt.Sprintf("%s 在 %dms 内没有响应：后端可能卡死或过载、防火墙丢弃了连接，或 backendTimeoutMs 太小", prefix, timeoutMS)
-	case kind == "dns_error":
-		return prefix + " 的主机名无法解析：检查 httpEndpoint 拼写或 DNS"
-	case kind == "redirect_refused":
-		return prefix + " 返回了重定向：httpEndpoint 可能指向了 Nginx 的 HTTPS 跳转或其他站点，应直接指向 Impostor 的内部 HTTP 端口"
-	case kind == "invalid_payload" || kind == "invalid_json":
-		return prefix + " 返回的内容不是预期的 JSON：httpEndpoint 可能指向了其他服务，或后端版本与网关不匹配"
-	default:
-		return fmt.Sprintf("%s 请求失败（%s）", prefix, kind)
-	}
+func quiet(w *requestLog) {
+	w.quiet = true
 }
 
 func truncate(s string, n int) string {
@@ -159,10 +125,10 @@ func forwardedClient(r *http.Request) string {
 	return ""
 }
 
-func logRequests(next http.Handler) http.Handler {
+func (g *gateway) logRequests() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		id := fmt.Sprintf("%x-%d", requestEpoch, requestSequence.Add(1))
+		id := fmt.Sprintf("%x-%d", g.requestEpoch, g.requestSeq.Add(1))
 		w.Header().Set("X-Request-ID", id)
 		rw := &requestLog{ResponseWriter: w, fields: map[string]any{
 			"event": "http_request", "request_id": id, "method": r.Method,
@@ -195,12 +161,11 @@ func logRequests(next http.Handler) http.Handler {
 			if len(rw.hints) > 0 {
 				rw.fields["hint"] = strings.Join(rw.hints, "；")
 			}
-			stats.record(rw)
+			g.stats.record(rw)
 			if rw.quiet && rw.status < 400 {
 				return
 			}
-			data, _ := json.Marshal(rw.fields)
-			log.Print(string(data))
+			logEvent(rw.fields)
 			if rw.level >= levelWarn {
 				hint := strings.Join(rw.seriousHints, "；")
 				if hint == "" {
@@ -213,11 +178,11 @@ func logRequests(next http.Handler) http.Handler {
 				log.Printf("[%s] %s %s %s -> %d %s: %s", strings.ToUpper(levelNames[rw.level]), id, r.Method, r.URL.Path, rw.status, codes, hint)
 			}
 		}()
-		next.ServeHTTP(rw, r)
+		g.serve(rw, r)
 	})
 }
 
-func logVersion(w http.ResponseWriter, version int64) {
+func logVersion(w *requestLog, version int64) {
 	setLogField(w, "client_version", version)
 	setLogField(w, "normalized_version", normalizeVersion(version))
 	if version >= minRawVersion && version <= maxVersion {
@@ -228,14 +193,14 @@ func logVersion(w http.ResponseWriter, version int64) {
 	}
 }
 
-func logBackend(w http.ResponseWriter, b *Backend) {
+func logBackend(w *requestLog, b *Backend) {
 	setLogField(w, "backend", b.Name)
 	setLogField(w, "backend_endpoint", b.HTTPEndpoint)
 	setLogField(w, "public_ip", b.PublicIP)
 	setLogField(w, "public_port", b.PublicPort)
 }
 
-func (g *gateway) logRoute(w http.ResponseWriter, r routeResult) {
+func (g *gateway) logRoute(w *requestLog, r routeResult) {
 	setLogField(w, "route", r.kind)
 	if r.backend == nil {
 		return
@@ -243,11 +208,14 @@ func (g *gateway) logRoute(w http.ResponseWriter, r routeResult) {
 	logBackend(w, r.backend)
 	if r.kind != routeExact {
 		setLogField(w, "backend_range", r.backend.rangeText())
-		warnOnceThenInfo(w, "route:"+r.kind+":"+versionText(r.normalized), "version_"+r.kind, g.config.routeHint(r))
+		g.warnOnceThenInfo(w, "route:"+r.kind+":"+versionText(r.normalized), "version_"+r.kind, hintRoute(g.config, r))
 	}
 }
 
+// logEvent writes one JSON object with a timestamp field. Run disables the standard
+// log prefix, so collectors can parse every line as JSON.
 func logEvent(fields map[string]any) {
+	fields["time"] = time.Now().Format(time.RFC3339Nano)
 	data, _ := json.Marshal(fields)
 	log.Print(string(data))
 }

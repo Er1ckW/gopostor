@@ -17,3 +17,25 @@ func TestCreateTokenWireFormat(t *testing.T) {
 		t.Fatalf("token payload = %s; want %s", data, want)
 	}
 }
+
+func FuzzParseTokenVersion(f *testing.F) {
+	f.Add("")
+	f.Add("Bearer !!!")
+	f.Add("Bearer " + createToken("player", 50595550))
+	f.Fuzz(func(t *testing.T, header string) {
+		version, _, err := parseTokenVersion(header)
+		if err == nil && (version < 1 || version > maxVersion) {
+			t.Fatalf("accepted invalid version %d", version)
+		}
+	})
+}
+
+func BenchmarkParseTokenVersion(b *testing.B) {
+	header := "Bearer " + createToken("player", 50595550)
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if _, _, err := parseTokenVersion(header); err != nil {
+			b.Fatal(err)
+		}
+	}
+}

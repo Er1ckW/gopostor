@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -15,12 +16,14 @@ import (
 )
 
 // Run loads the configuration and runs the gateway until shutdown is requested.
-func Run() {
+// It returns an error instead of exiting so the caller decides the process exit code.
+func Run() error {
+	log.SetFlags(0)
 	path := flag.String("config", "config.json", "configuration file path")
 	flag.Parse()
 	config, err := loadConfig(*path)
 	if err != nil {
-		log.Fatalf("[ERROR] 无法加载配置 %q: %v", *path, err)
+		return fmt.Errorf("无法加载配置 %q: %w", *path, err)
 	}
 	log.Printf("Configuration loaded: path=%q listen=%s:%d backend_timeout_ms=%d reject_unknown_versions=%t probe_backend_on_create=%t health_check_interval_sec=%d stats_interval_sec=%d",
 		*path, config.ListenIP, config.ListenPort, config.BackendTimeoutMS, config.RejectUnknownVersions, config.ProbeBackendOnCreate, config.HealthCheckIntervalSec, config.StatsIntervalSec)
@@ -56,7 +59,7 @@ func Run() {
 				case <-ctx.Done():
 					return
 				case <-ticker.C:
-					stats.flush(window)
+					g.stats.flush(window)
 				}
 			}
 		}()
@@ -76,8 +79,9 @@ func Run() {
 	}()
 	log.Printf("gopostor listening on %s; %d backends; config: %s", server.Addr, len(config.Backends), *path)
 	if err := server.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
-		log.Fatalf("[ERROR] 无法监听 %s: %v（端口被占用时，检查旧的 Bun 服务或另一个 gopostor 是否仍在运行）", server.Addr, err)
+		return fmt.Errorf("无法监听 %s: %w（端口被占用时，检查旧的 Bun 服务或另一个 gopostor 是否仍在运行）", server.Addr, err)
 	}
 	<-done
 	log.Print("Shutdown complete")
+	return nil
 }

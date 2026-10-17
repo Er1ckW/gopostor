@@ -53,7 +53,8 @@ ARM64 服务器将 GOARCH 改为 arm64。上传对应架构的二进制文件。
 │   ├── proxy.go                 # 后端请求、创建探测、错误分类和兼容处理
 │   ├── response.go              # JSON 响应、错误响应和公网地址改写
 │   ├── health.go                # 后端健康检查和状态
-│   ├── logging.go               # 请求/事件日志、路由日志和诊断提示
+│   ├── logging.go               # 请求/事件日志、请求 ID 和字段
+│   ├── hints.go                 # 面向运维的中文提示文案
 │   ├── stats.go                 # 请求汇总统计
 │   └── *_test.go                # 同包测试
 └── deploy/
@@ -76,6 +77,8 @@ ARM64 服务器将 GOARCH 改为 arm64。上传对应架构的二进制文件。
 | `backends[]` | | 每个后端的 `name`、`minVersion`、`maxVersion`、`publicIp`、`publicPort`、`httpEndpoint` |
 
 以下为 [示例配置](config.example.json) 中的两个后端。版本范围应根据实际部署的 Impostor 所支持的客户端协议版本调整。
+
+配置按 JSON 严格解析：出现未知字段（通常是拼写错误）会在启动时直接报错，不会静默回退到默认值。示例中的 `source` 仅用于记录版本范围的来源，可以省略。
 
 | 示例实例 | 内部协议范围 | HTTP 地址 | 公网 UDP 端口 |
 |---|---|---|---|
@@ -101,7 +104,7 @@ ARM64 服务器将 GOARCH 改为 arm64。上传对应架构的二进制文件。
 - **/api/user**：只要求有效的 `ClientVersion`（数字或数字字符串）。`Puid`、`Username`、`Language` 缺失或为空时照常签发 token，与 Impostor 一样使用 Base64 JSON、固定 Hash 和默认过期时间。token 不校验 EOS 签名。
 - **PUT /api/games**：先探测后端（见 `probeBackendOnCreate`），再返回配置中的公网地址。后端自报的 PublicIp/PublicPort 与配置不一致时记录警告。
 - **查询类请求**：携带原 Authorization 转发给后端，并把返回的 IP/端口改写成配置值。
-- **后端错误**：只把 `Errors[].Reason` 转给客户端，丢弃 Impostor 写在 `Message` 里的异常文本。后端没有该接口（Impostor 1.9.x 对 16.0 以后的接口返回空 404）时，由网关返回空列表或"房间不存在"（Reason 3）。`GET /api/games/{id}` 的错误响应总是带 `"Game":null`。
+- **后端错误**：只把 `Errors[].Reason` 转给客户端，丢弃 Impostor 写在 `Message` 里的异常文本。后端没有该接口（Impostor 1.9.x 对 16.0 以后的接口返回空 404）时，由网关返回空列表或"房间不存在"（Reason 3）。`GET /api/games/{id}` 的错误响应总是带 `"Game":null`。`/api/filtertags` 是例外：1.9.3 和 1.10.9 都没有实现它，网关返回 `404 Reason 17`，与旧行为一致。
 - **网关错误码**：token 缺失/无效 `401 Reason 11`；后端连接失败、超时、重定向或无效响应 `502 Reason 17`；房间码格式错误 `400 Reason 3`。
 
 **后端仍需正确处理房间列表的版本兼容性过滤，并保持 `Compatibility.AllowVersionMixing=false`。** Go 网关不替代后端的房间版本过滤。所有后端都必须启用内部 HTTP 服务。
@@ -152,10 +155,10 @@ sudo nginx -t && sudo systemctl reload nginx
 
 ## 排查日志
 
-所有日志写入 stderr，由 systemd 收集。每个请求一行 JSON；有问题的请求在 JSON 后面再跟一行可读提示，以 `[WARN]` 或 `[ERROR]` 开头，说明可能的原因和要检查的配置。只看问题：
+所有日志写入 stderr，由 systemd 收集。每个请求一行 JSON，行内带 `time` 字段；`log` 不再添加时间戳前缀，采集器可以直接按行解析 JSON。有问题的请求在 JSON 后面再跟一行可读提示，以 `[WARN]` 或 `[ERROR]` 开头，说明可能的原因和要检查的配置。只看问题：
 
 ```sh
-sudo journalctl -u gopostor -o cat | grep -E '^\S+ \S+ \[(WARN|ERROR)\]'
+sudo journalctl -u gopostor -o cat | grep -E '^\[(WARN|ERROR)\]'
 sudo journalctl -u gopostor -f -o cat | grep -E '\[(WARN|ERROR|INFO|STATS)\]'
 ```
 
@@ -208,9 +211,16 @@ sudo journalctl -u gopostor -f -o cat | grep -E '\[(WARN|ERROR|INFO|STATS)\]'
 ```sh
 go test ./...
 go vet ./...
+go test -race ./...   # 需要 CGO，通常在 Linux/CI 上执行
 ```
 
-默认测试可在单独克隆的本仓库中运行，读取提交的 `config.example.json`，不依赖本地实际配置或外部 Impostor 源码。测试包含本地模拟后端、token 原始 JSON 格式与往返、宽松字段、各版本范围与回退路由、+25 标志、负数房间码、地址改写、创建探测、后端错误清理、1.9.x 缺失接口、健康检查、日志字段与隐私、错误和超时。
+默认测试可在单独克隆的本仓库中运行，读取提交的 `config.example.json`，不依赖本地实际配置或外部 Impostor 源码。测试包含本地模拟后端、token 原始 JSON 格式与往返、宽松字段、各版本范围与回退路由、+25 标志、负数房间码、地址改写、创建探测、后端错误清理、1.9.x 缺失接口、健康检查、日志字段与隐私、错误和超时。仓库的 GitHub Actions 会执行 `gofmt`、`go vet` 和 `go test -race`。
+
+`parseTokenVersion` 还有一个 fuzz 目标：
+
+```sh
+go test ./internal/gateway -fuzz=FuzzParseTokenVersion -fuzztime=30s
+```
 
 如需额外核对 Impostor 的支持名单，设置环境变量 `IMPOSTOR_SOURCE_ROOT`，指向同时包含 `Impostor-1.9.3/` 和 `Impostor-1.10.9/` 的目录。测试会读取其中的 `src/Impostor.Server/Net/Manager/CompatibilityManager.cs`。未设置该变量时只跳过 `TestReleaseCompatibility`；设置后源码缺失或核对不一致都会使测试失败。
 

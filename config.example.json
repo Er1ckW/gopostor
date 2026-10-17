@@ -1,0 +1,28 @@
+{
+  "source": "Impostor-1.9.3 and Impostor-1.10.9: src/Impostor.Server/Net/Manager/CompatibilityManager.cs",
+  "listenIp": "127.0.0.1",
+  "listenPort": 24000,
+  "backendTimeoutMs": 5000,
+  "rejectUnknownVersions": false,
+  "probeBackendOnCreate": true,
+  "healthCheckIntervalSec": 30,
+  "statsIntervalSec": 600,
+  "backends": [
+    {
+      "name": "1.9.3",
+      "minVersion": "2023.10.1",
+      "maxVersion": "2024.2.3",
+      "publicIp": "127.0.0.1",
+      "publicPort": 22031,
+      "httpEndpoint": "http://127.0.0.1:23001"
+    },
+    {
+      "name": "1.10.9",
+      "minVersion": "2024.3.1",
+      "maxVersion": "2026.7.21",
+      "publicIp": "127.0.0.1",
+      "publicPort": 22032,
+      "httpEndpoint": "http://127.0.0.1:23002"
+    }
+  ]
+}

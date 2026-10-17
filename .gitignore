@@ -1,0 +1,40 @@
+# Local runtime configuration (copy config.example.json to config.json)
+/config.json
+/config.local.json
+/config.*.local.json
+.env
+.env.*
+!.env.example
+
+# Build output
+/gopostor
+/gopostor.exe
+/dist/
+/bin/
+/build/
+*.exe
+*.test
+*.test.exe
+
+# Test coverage and profiling output
+/coverage/
+coverage.out
+coverage-*.out
+*.coverprofile
+*.prof
+*.pprof
+
+# Runtime logs and temporary files
+/logs/
+*.log
+*.tmp
+*.swp
+*.swo
+*~
+
+# Local editor and operating system files
+/.idea/
+/.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini

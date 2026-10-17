@@ -1,0 +1,24 @@
+[Unit]
+Description=Gopostor HTTP matchmaking gateway
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=exec
+User=gopostor
+Group=gopostor
+WorkingDirectory=/opt/gopostor
+ExecStart=/opt/gopostor/gopostor -config /opt/gopostor/config.json
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=gopostor
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

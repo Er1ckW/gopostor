@@ -6,7 +6,6 @@
   "rejectUnknownVersions": false,
   "probeBackendOnCreate": true,
   "healthCheckIntervalSec": 30,
-  "statsIntervalSec": 600,
   "backends": [
     {
       "name": "1.9.3",

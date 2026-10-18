@@ -1,9 +1,15 @@
+// 本文件跟踪每个后端是否可达，并把这些状态提供给 /healthz。
+//
+// 健康状态有两个来源：
+//   - 后台定时检查：定期对后端 GET /；
+//   - 真实请求：每次转发请求的结果也会更新状态。
+//
+// 健康检查不再输出日志；/healthz 仍然返回这些状态。
 package gateway
 
 import (
 	"context"
 	"io"
-	"log"
 	"net/http"
 	"sync"
 	"time"
@@ -15,6 +21,7 @@ const (
 	stateDown    = "down"
 )
 
+// backendState 是单个后端的健康快照，也是 /healthz 返回数组里的元素。
 type backendState struct {
 	Name      string    `json:"name"`
 	Endpoint  string    `json:"endpoint"`
@@ -26,18 +33,17 @@ type backendState struct {
 	Failures  int       `json:"consecutive_failures"`
 }
 
-// healthMonitor tracks whether each backend answers HTTP, from periodic checks and from live traffic,
-// and logs every change of state once instead of once per failed request.
+// healthMonitor 保存所有后端的状态，由 mutex 保护。
 type healthMonitor struct {
-	mu        sync.Mutex
-	states    map[string]*backendState
-	backends  []*Backend
-	client    *http.Client
-	timeoutMS int
+	mu       sync.Mutex
+	states   map[string]*backendState
+	backends []*Backend
+	client   *http.Client
 }
 
+// newHealthMonitor 为每个后端建立初始状态（unknown）。
 func newHealthMonitor(c *Config, client *http.Client) *healthMonitor {
-	m := &healthMonitor{states: map[string]*backendState{}, client: client, timeoutMS: c.BackendTimeoutMS}
+	m := &healthMonitor{states: map[string]*backendState{}, client: client}
 	for i := range c.Backends {
 		b := &c.Backends[i]
 		m.backends = append(m.backends, b)
@@ -46,64 +52,34 @@ func newHealthMonitor(c *Config, client *http.Client) *healthMonitor {
 	return m
 }
 
-// record updates the state of a backend. source names what produced the result (startup, check, request).
-func (m *healthMonitor) record(b *Backend, err error, latency time.Duration, source string) {
+// record 用一次检查/请求的结果更新后端状态。
+func (m *healthMonitor) record(b *Backend, err error, latency time.Duration) {
 	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	s := m.states[b.Name]
 	if s == nil {
-		m.mu.Unlock()
 		return
 	}
 	now := time.Now()
-	previous, downFor := s.State, now.Sub(s.Since).Round(time.Second)
 	s.LastCheck, s.LatencyMS = now, latency.Milliseconds()
-	var kind failureKind
 	if err != nil {
-		kind = classifyError(err)
 		s.Failures++
-		s.LastError = string(kind)
-		if previous != stateDown {
+		s.LastError = string(classifyError(err))
+		if s.State != stateDown {
 			s.State, s.Since = stateDown, now
 		}
-	} else {
-		s.Failures, s.LastError = 0, ""
-		if previous != stateUp {
-			s.State, s.Since = stateUp, now
-		}
+		return
 	}
-	failures := s.Failures
-	m.mu.Unlock()
-
-	event := map[string]any{"event": "backend_health", "backend": b.Name, "backend_endpoint": b.HTTPEndpoint, "source": source, "latency_ms": latency.Milliseconds()}
-	switch {
-	case err != nil && previous != stateDown:
-		event["level"], event["state"], event["error_kind"] = "error", stateDown, kind
-		logEvent(event)
-		log.Printf("[ERROR] 后端 %s 不可达（%s，来源 %s）：%s。在恢复前，分配到该后端的创建/加入房间都会失败", b.Name, kind, source, hintBackendUnavailable(b, err, m.timeoutMS))
-	case err != nil && failures%20 == 0:
-		event["level"], event["state"], event["error_kind"], event["consecutive_failures"] = "error", stateDown, kind, failures
-		logEvent(event)
-		log.Printf("[ERROR] 后端 %s 仍不可达，已持续 %s、连续失败 %d 次（%s）", b.Name, downFor, failures, kind)
-	case err == nil && previous == stateDown:
-		event["level"], event["state"], event["down_for_sec"] = "info", stateUp, int(downFor.Seconds())
-		logEvent(event)
-		log.Printf("[INFO] 后端 %s 已恢复，中断约 %s", b.Name, downFor)
-	case err == nil && previous == stateUnknown:
-		event["level"], event["state"] = "info", stateUp
-		logEvent(event)
-		log.Printf("[INFO] 后端 %s（%s）HTTP 可达，耗时 %dms", b.Name, b.HTTPEndpoint, latency.Milliseconds())
+	s.Failures, s.LastError = 0, ""
+	if s.State != stateUp {
+		s.State, s.Since = stateUp, now
 	}
 }
 
-func (m *healthMonitor) isDown(b *Backend) bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	s := m.states[b.Name]
-	return s != nil && s.State == stateDown
-}
-
-// check sends GET / to the backend. Any HTTP answer counts as reachable: Impostor 1.9.x has no handler there.
-func (m *healthMonitor) check(ctx context.Context, b *Backend, source string) {
+// check 对一个后端执行 GET /。
+// 只要返回了任何 HTTP 响应（包括 404）都算可达。
+func (m *healthMonitor) check(ctx context.Context, b *Backend) {
 	start := time.Now()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, b.HTTPEndpoint+"/", nil)
 	if err == nil {
@@ -117,21 +93,23 @@ func (m *healthMonitor) check(ctx context.Context, b *Backend, source string) {
 	if ctx.Err() != nil {
 		return
 	}
-	m.record(b, err, time.Since(start), source)
+	m.record(b, err, time.Since(start))
 }
 
-func (m *healthMonitor) checkAll(ctx context.Context, source string) {
+// checkAll 并发检查所有后端，并等待全部完成。
+func (m *healthMonitor) checkAll(ctx context.Context) {
 	var wg sync.WaitGroup
 	for _, b := range m.backends {
 		wg.Add(1)
 		go func(b *Backend) {
 			defer wg.Done()
-			m.check(ctx, b, source)
+			m.check(ctx, b)
 		}(b)
 	}
 	wg.Wait()
 }
 
+// run 按固定间隔重复检查，直到 context 被取消。
 func (m *healthMonitor) run(ctx context.Context, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -140,11 +118,12 @@ func (m *healthMonitor) run(ctx context.Context, interval time.Duration) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			m.checkAll(ctx, "check")
+			m.checkAll(ctx)
 		}
 	}
 }
 
+// snapshot 返回所有后端状态的副本，供 /healthz 使用。
 func (m *healthMonitor) snapshot() (states []backendState, healthy bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

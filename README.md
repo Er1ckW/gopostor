@@ -53,9 +53,7 @@ ARM64 服务器将 GOARCH 改为 arm64。上传对应架构的二进制文件。
 │   ├── proxy.go                 # 后端请求、创建探测、错误分类和兼容处理
 │   ├── response.go              # JSON 响应、错误响应和公网地址改写
 │   ├── health.go                # 后端健康检查和状态
-│   ├── logging.go               # 请求/事件日志、请求 ID 和字段
-│   ├── hints.go                 # 面向运维的中文提示文案
-│   ├── stats.go                 # 请求汇总统计
+│   ├── logging.go               # 单行 JSON 访问日志
 │   └── *_test.go                # 同包测试
 └── deploy/
     ├── nginx/                   # Nginx 配置示例
@@ -73,8 +71,9 @@ ARM64 服务器将 GOARCH 改为 arm64。上传对应架构的二进制文件。
 | `rejectUnknownVersions` | `false` | 版本不在任何范围内时：`false` 转给最近的后端，由 Impostor 告诉玩家该更新游戏还是服务器过旧；`true` 时游戏请求直接返回 `404 Reason 5` |
 | `probeBackendOnCreate` | `true` | 创建房间前先向后端发送 `PUT /api/games`，后端不可用时立即返回错误，而不是让玩家等到 UDP 超时 |
 | `healthCheckIntervalSec` | `30` | 后台检查每个后端 `GET /` 的间隔，`0` 只在启动时检查 |
-| `statsIntervalSec` | `600` | 汇总日志的间隔，`0` 关闭 |
 | `backends[]` | | 每个后端的 `name`、`minVersion`、`maxVersion`、`publicIp`、`publicPort`、`httpEndpoint` |
+
+`statsIntervalSec` 已废弃：旧配置仍然可以解析，但当前版本不再输出统计汇总。
 
 以下为 [示例配置](config.example.json) 中的两个后端。版本范围应根据实际部署的 Impostor 所支持的客户端协议版本调整。
 
@@ -87,7 +86,7 @@ ARM64 服务器将 GOARCH 改为 arm64。上传对应架构的二进制文件。
 
 版本范围包含两端，不能重叠。版本可以写成 `2023.10.1` / `2022.2.24.1`，也可以写成客户端上报的整数（如 `50595550`）；`minVersion` 留空表示不设下限，`maxVersion` 留空表示不设上限。版本编码为 `年*25000 + 月*1800 + 日*50 + revision`，路由时去掉 +25 标志，token 保留原始版本。
 
-部署前修改 `publicIp`、`publicPort`、`httpEndpoint`。公网 IP 必须为 IPv4；示例回环地址仅供本机测试，启动时会给出警告。客户端 HTTPS 由 Nginx 转发到网关，游戏 UDP 直接连到对应的 Impostor。
+部署前修改 `publicIp`、`publicPort`、`httpEndpoint`。公网 IP 必须为 IPv4；示例回环地址仅供本机测试，正式部署必须改成玩家可连通的公网 IPv4。客户端 HTTPS 由 Nginx 转发到网关，游戏 UDP 直接连到对应的 Impostor。
 
 ### 版本路由
 
@@ -147,64 +146,47 @@ sudo nginx -t && sudo systemctl reload nginx
 ```
 
 - 80 端口不跳转 HTTPS：重定向后的 POST/PUT 会变成 GET，匹配会失败。手机必须走 HTTPS。
-- 转发 `Authorization`；`X-Real-IP` 会作为 `forwarded_client` 显示在 gopostor 日志中。
-- `/healthz` 只允许本机访问；每个 IP 限 20 次/秒、突发 40，超出返回 429，网吧等多人共用 IP 时可调大。
+- 转发 `Authorization`；`X-Real-IP` 会作为 `client_ip` 显示在 gopostor 日志中。
+- `/healthz` 只允许本机访问；普通匹配请求按客户端 IP 限 20 次/秒、突发 40，超出返回 429，网吧等多人共用 IP 时可调大。
 - 不对上游重试，避免同一个 PUT 被发送两次；`proxy_read_timeout 15s` 大于 `backendTimeoutMs`。
-- 访问日志 `/var/log/nginx/gopostor.access.log` 里的 `request_id=` 与 gopostor 日志的 `request_id` 相同，可用来对照同一个请求。
+- 访问日志 `/var/log/nginx/gopostor.access.log` 记录 Nginx 侧的请求行、状态和上游耗时，可与 gopostor 的同名请求对照。
 - 中国大陆服务器的 80/443 端口通常要求域名已备案，否则会被云厂商拦截，表现为客户端连不上、gopostor 也没有任何请求日志。
 
-## 排查日志
+## 访问日志
 
-所有日志写入 stderr，由 systemd 收集。每个请求一行 JSON，行内带 `time` 字段；`log` 不再添加时间戳前缀，采集器可以直接按行解析 JSON。有问题的请求在 JSON 后面再跟一行可读提示，以 `[WARN]` 或 `[ERROR]` 开头，说明可能的原因和要检查的配置。只看问题：
+所有日志写入 stderr，由 systemd 收集。每个请求只输出一行 JSON，`log` 不再添加时间戳前缀，采集器可以直接按行解析。字段固定为：
 
-```sh
-sudo journalctl -u gopostor -o cat | grep -E '^\[(WARN|ERROR)\]'
-sudo journalctl -u gopostor -f -o cat | grep -E '\[(WARN|ERROR|INFO|STATS)\]'
+| 字段 | 含义 |
+|---|---|
+| `time` | 请求结束时间（RFC3339Nano） |
+| `client_ip` | 客户端 IP；直连对端是本机代理时优先取 `X-Real-IP` / `X-Forwarded-For` |
+| `peer` | TCP 直连对端的 `host:port` |
+| `method` / `path` / `query` | 请求方法、路径、原始查询参数 |
+| `user_agent` | 请求的 User-Agent |
+| `request_content_type` | 请求的 Content-Type |
+| `request_body` | 完整请求体 |
+| `status` | 响应状态码 |
+| `response_content_type` | 响应的 Content-Type |
+| `response_body` | 完整响应体 |
+| `duration_ms` | 从读取请求体到写完响应的耗时（毫秒） |
+
+示例：
+
+```json
+{"time":"2026-10-18T16:02:21.123+08:00","client_ip":"203.0.113.9","peer":"127.0.0.1:54321","method":"POST","path":"/api/user","query":"","user_agent":"AmongUs/...","request_content_type":"application/json","request_body":"{\"Puid\":\"...\",\"ClientVersion\":50595550}","status":200,"response_content_type":"text/plain; charset=utf-8","response_body":"eyJDb250ZW50...","duration_ms":12}
 ```
 
-### 启动时
+查看：
 
-- 实际加载的配置路径、各项设置、每个后端的版本范围、HTTP 地址和公网 UDP 地址。
-- `[WARN] 配置检查：`publicIp 是回环或内网地址等会导致玩家连不上的配置。
-- `[INFO] 配置说明：`版本范围间隙、最高版本上限，以及这些版本会转给哪个后端。
-- 每个后端的首次健康检查：`[INFO] 后端 X HTTP 可达` 或 `[ERROR] 后端 X 不可达（connection_refused…）：检查 Impostor 是否在运行、HttpServer.Enabled…`。
+```sh
+sudo journalctl -u gopostor -f -o cat
+```
 
-### 运行中
+> **安全警告**：请求和响应 body 会原样写入日志。`/api/user` 的响应 body 就是 token，请求 body 可能包含 `Puid`、`Username`；日志文件因此属于敏感数据，必须限制读取权限。当前实现不限制 body 大小，超大请求或大房间列表会造成内存和磁盘压力；生产环境应增加上限，或只在临时调试时保留 body。
 
-- **后端状态变化**：后端从可达变为不可达、恢复时各记一行（`event=backend_health`），持续不可达时每 20 次失败提醒一次，不会每个请求刷屏。状态来自后台检查和真实请求。
-- **请求 JSON 字段**：
-  - `level`：`info` / `warn` / `error`；`issues`：问题代码列表；`hint`：中文原因和处理建议。
-  - `request_id`：同时出现在响应 `X-Request-ID` 和转发给后端的同名请求头中。
-  - `status`、`duration_ms`、`response_bytes`：最终状态、处理耗时和响应大小。
-  - `client_version`、`normalized_version`、`client_version_text`：整数协议版本、去掉 +25 标志后的值和可读版本；`disable_server_authority_flag` 表示带 +25 标志。
-  - `route`：`exact`、`below_range`、`between_ranges`、`above_range`；`backend`、`backend_endpoint`、`public_ip`、`public_port`、`backend_range`：路由结果。
-  - `missing_fields`、`validation_error`、`invalid_field(s)`、`token_problem`：请求或 token 的具体问题，只输出字段名。
-  - `backend_stage`、`backend_status`、`backend_duration_ms`、`error_kind`、`backend_reasons`、`backend_message`（首行，最多 160 字）、`backend_reported_address`：后端交互的细节。
-  - `response_source`：`gateway` 表示网关生成响应，`backend` 表示收到后端响应后透传或改写。
-  - `host`、`user_agent`、`peer`、`forwarded_client`：请求来源。`forwarded_client` 只在直连对端是本机代理时才读取 `X-Real-IP` / `X-Forwarded-For`。
-- **统计**：每 `statsIntervalSec` 秒输出一行 `[STATS]`，包含请求数、状态分布、各后端请求数、`/api/user` 的客户端版本分布和问题代码计数；没有流量的时间段不输出。
+配置成功、后端列表、健康状态变化、统计汇总、warn-once 提示都不再单独输出日志；后端状态仍可通过 `/healthz` 查看。请求在进入 Go handler 之前失败（例如 HTTP 解析错误）不会被记录，后端 UDP 握手也不会记录。
 
-不记录 Authorization 内容、token、PUID、用户名、原始请求/响应正文或查询参数。健康的 `/healthz` 请求不写日志，方便监控高频轮询。
-
-### 常见问题代码
-
-| 代码 | 级别 | 含义 / 处理 |
-|---|---|---|
-| `backend_unavailable` | error | 后端连接被拒绝、超时、DNS 失败、返回重定向或无效 JSON，hint 按 `error_kind` 给出要检查的项 |
-| `backend_rejected_create` | error | 创建房间探测时后端返回非 2xx 或无效内容 |
-| `backend_error_unparsed` | error | 后端返回的错误不是 Impostor 格式，通常 `httpEndpoint` 指向了 Nginx 或其他服务 |
-| `backend_slow` | warn | 后端用时超过超时时间的一半 |
-| `backend_public_address_mismatch` | warn | 后端 config.json 的 PublicIp/PublicPort 与网关配置不一致 |
-| `backend_endpoint_missing` | warn→info | 后端没有该接口（1.9.x 不支持 16.0+ 接口），网关已代为回应 |
-| `version_below_range` / `version_above_range` / `version_between_ranges` | warn→info | 客户端版本不在任何范围内，hint 说明转给了哪个后端以及如何调整 |
-| `invalid_token` | warn | `token_problem=missing_authorization` 时多半是 Nginx 没有转发 Authorization；其他情况是客户端用了别处签发的 token |
-| `token_request_*` | warn | `/api/user` 请求体无法读取、不是 JSON 或没有有效 `ClientVersion` |
-| `token_fields_missing` | info | 缺少 Puid/Username/Language，通常是旧版客户端，照常签发 token |
-| `game_not_found` | info | 后端上没有该房间码 |
-
-标注 "warn→info" 的问题对同一个后端/版本只在首次以 WARN 显示，之后只记在 JSON 中，避免刷屏。
-
-若客户端报错而没有对应请求日志，请检查 Nginx 日志和请求目标地址：请求可能未进入 Go handler，或在 HTTP 协议解析阶段被拒绝。这里的请求日志不涵盖 HTTP 解析之前的错误，也不涵盖后端 UDP 握手。v2023.11.28 的内部版本为 2023.11.15（50595550，带标志为 50595575）。
+若客户端报错而没有对应请求日志，请检查 Nginx 日志和请求目标地址：请求可能未进入 Go handler，或在 HTTP 协议解析阶段被拒绝。v2023.11.28 的内部版本为 2023.11.15（50595550，带标志为 50595575）。
 
 ## 测试命令
 
@@ -214,7 +196,7 @@ go vet ./...
 go test -race ./...   # 需要 CGO，通常在 Linux/CI 上执行
 ```
 
-默认测试可在单独克隆的本仓库中运行，读取提交的 `config.example.json`，不依赖本地实际配置或外部 Impostor 源码。测试包含本地模拟后端、token 原始 JSON 格式与往返、宽松字段、各版本范围与回退路由、+25 标志、负数房间码、地址改写、创建探测、后端错误清理、1.9.x 缺失接口、健康检查、日志字段与隐私、错误和超时。仓库的 GitHub Actions 会执行 `gofmt`、`go vet` 和 `go test -race`。
+默认测试可在单独克隆的本仓库中运行，读取提交的 `config.example.json`，不依赖本地实际配置或外部 Impostor 源码。测试包含本地模拟后端、token 原始 JSON 格式与往返、宽松字段、各版本范围与回退路由、+25 标志、负数房间码、地址改写、创建探测、后端错误清理、1.9.x 缺失接口、健康检查和访问日志字段。仓库的 GitHub Actions 会执行 `gofmt`、`go vet` 和 `go test -race`。
 
 `parseTokenVersion` 还有一个 fuzz 目标：
 

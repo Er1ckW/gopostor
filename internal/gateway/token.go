@@ -1,3 +1,7 @@
+// 本文件负责 Among Us 的 /api/user 登录接口，以及 token 的签发和解析。
+//
+// 日志已经移出业务逻辑：serveToken 只负责解析请求、生成 token、写响应，
+// 不再记录字段、问题代码或提示文案。
 package gateway
 
 import (
@@ -11,17 +15,21 @@ import (
 	"strings"
 )
 
+// tokenContent 是 token 的 Content 部分，字段名和 JSON 标签必须与 Impostor 一致。
 type tokenContent struct {
 	PUID          string `json:"Puid"`
 	ClientVersion int64  `json:"ClientVersion"`
 	ExpiresAt     string `json:"ExpiresAt"`
 }
 
+// token 是完整的 token 结构。
 type token struct {
 	Content tokenContent `json:"Content"`
 	Hash    string       `json:"Hash"`
 }
 
+// createToken 按 Impostor 的格式签发 token：Base64(JSON)。
+// ExpiresAt 和 Hash 使用固定值，保持与 Impostor 的兼容性。
 func createToken(puid string, version int64) string {
 	data, _ := json.Marshal(token{
 		Content: tokenContent{PUID: puid, ClientVersion: version, ExpiresAt: "2012-12-21T00:00:00"},
@@ -30,121 +38,91 @@ func createToken(puid string, version int64) string {
 	return base64.StdEncoding.EncodeToString(data)
 }
 
+// bearerPattern 匹配 "Bearer <base64>"。
 var bearerPattern = regexp.MustCompile(`(?i)^Bearer\s+([A-Za-z0-9+/]+={0,2})$`)
 
-// parseTokenVersion reads the client version out of the matchmaking token. The problem code says why a token was refused.
-// Only the version is required: Impostor itself never checks the Puid or the Hash.
-func parseTokenVersion(header string) (int64, string, error) {
+// parseTokenVersion 从 Authorization 头中读出客户端版本。
+// 只要求 ClientVersion 合法；不校验 Puid 和 Hash。
+func parseTokenVersion(header string) (int64, error) {
 	if strings.TrimSpace(header) == "" {
-		return 0, "missing_authorization", fmt.Errorf("missing token")
+		return 0, fmt.Errorf("missing token")
 	}
 	m := bearerPattern.FindStringSubmatch(strings.TrimSpace(header))
 	if m == nil || len(m[1]) > 16384 {
-		return 0, "not_bearer_base64", fmt.Errorf("invalid token")
+		return 0, fmt.Errorf("invalid token")
 	}
 	data, err := base64.StdEncoding.Strict().DecodeString(m[1])
 	if err != nil {
-		return 0, "invalid_base64", err
+		return 0, err
 	}
 	var t struct {
 		Content struct{ ClientVersion json.RawMessage }
 	}
 	if err = json.Unmarshal(data, &t); err != nil {
-		return 0, "invalid_json", err
+		return 0, err
 	}
-	version, _, ok := flexibleInt(t.Content.ClientVersion)
+	version, ok := flexibleInt(t.Content.ClientVersion)
 	if !ok || version < 1 || version > maxVersion {
-		return 0, "invalid_client_version", fmt.Errorf("invalid token payload")
+		return 0, fmt.Errorf("invalid token payload")
 	}
-	return version, "", nil
+	return version, nil
 }
 
-// flexibleInt accepts a JSON number or a number in a string, like ASP.NET Core does for Impostor.
-func flexibleInt(raw json.RawMessage) (value int64, quoted, ok bool) {
+// flexibleInt 接受 JSON 数字或数字字符串，返回解析出的整数和是否成功。
+func flexibleInt(raw json.RawMessage) (int64, bool) {
 	s := strings.TrimSpace(string(raw))
 	if s == "" || s == "null" {
-		return 0, false, false
+		return 0, false
 	}
 	if strings.HasPrefix(s, `"`) {
 		if json.Unmarshal(raw, &s) != nil {
-			return 0, true, false
+			return 0, false
 		}
-		s, quoted = strings.TrimSpace(s), true
+		s = strings.TrimSpace(s)
 	}
 	n, err := strconv.ParseInt(s, 10, 64)
-	return n, quoted, err == nil
+	return n, err == nil
 }
 
-func (g *gateway) serveToken(w *requestLog, r *http.Request) {
+// serveToken 处理 POST /api/user：校验请求体、签发 token。
+//
+// Puid/Username 缺失也照常签发 token，与 Impostor 保持一致。
+func (g *gateway) serveToken(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
-		issue(w, levelInfo, "method_not_allowed", "")
 		w.Header().Set("Allow", "POST")
 		writeErrorResponse(w, 405, reasonError, "Use POST")
 		return
 	}
+
+	// Username 字段本身不再使用，但保留在这里是为了保持原有的类型校验：
+	// 如果客户端把 Username 传成数字，json.Unmarshal 仍会返回类型错误。
 	var user struct {
 		PUID          *string `json:"Puid"`
 		Username      *string
-		Language      json.RawMessage
 		ClientVersion json.RawMessage
 	}
+
 	data, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 65536))
 	if err != nil {
-		setLogField(w, "validation_error", "request_body_read_failed")
-		setLogField(w, "error_kind", classifyError(err))
-		issue(w, levelWarn, "token_request_unreadable", hintTokenRequestUnreadable())
 		writeErrorResponse(w, 400, reasonError, "Invalid token request")
 		return
 	}
 	if err = json.Unmarshal(data, &user); err != nil {
-		setLogField(w, "validation_error", "invalid_json_or_field_type")
-		setLogField(w, "error_kind", classifyError(err))
-		// Report only known schema field names, never raw JSON or values.
-		if fieldError, ok := err.(*json.UnmarshalTypeError); ok {
-			switch fieldError.Field {
-			case "Puid", "Username", "Language", "ClientVersion":
-				setLogField(w, "invalid_field", fieldError.Field)
-			}
-		}
-		issue(w, levelWarn, "token_request_invalid_json", hintTokenRequestInvalidJSON())
 		writeErrorResponse(w, 400, reasonError, "Invalid token request")
 		return
 	}
-	version, quoted, ok := flexibleInt(user.ClientVersion)
-	if quoted {
-		setLogField(w, "client_version_quoted", true)
-	}
-	if !ok || version < 1 || version > maxVersion {
-		setLogField(w, "validation_error", "missing_or_invalid_client_version")
-		setLogField(w, "invalid_fields", []string{"ClientVersion"})
-		issue(w, levelWarn, "token_request_invalid_version", hintTokenRequestInvalidVersion())
-		writeErrorResponse(w, 400, reasonError, "Invalid token request")
-		return
-	}
-	logVersion(w, version)
 
-	// Older clients do not send Username or Language and some accounts have no name: none of them are needed.
-	var missing []string
-	if user.PUID == nil || strings.TrimSpace(*user.PUID) == "" {
-		missing = append(missing, "Puid")
+	version, ok := flexibleInt(user.ClientVersion)
+	if !ok || version < 1 || version > maxVersion {
+		writeErrorResponse(w, 400, reasonError, "Invalid token request")
+		return
 	}
-	if user.Username == nil || strings.TrimSpace(*user.Username) == "" {
-		missing = append(missing, "Username")
-	}
-	if language, _, ok := flexibleInt(user.Language); ok {
-		setLogField(w, "language", language)
-	} else {
-		missing = append(missing, "Language")
-	}
-	if len(missing) > 0 {
-		setLogField(w, "missing_fields", missing)
-		issue(w, levelInfo, "token_fields_missing", hintTokenFieldsMissing(missing))
-	}
+
 	puid := ""
 	if user.PUID != nil {
 		puid = *user.PUID
 	}
-	g.logRoute(w, g.config.route(version))
+
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	_, _ = io.WriteString(w, createToken(puid, version))

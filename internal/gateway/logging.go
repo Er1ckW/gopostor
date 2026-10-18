@@ -1,40 +1,61 @@
+// 本文件只做一件事：为每个 HTTP 请求输出一行简单的访问日志。
+//
+// 日志字段固定为：时间、来源、请求方法/路径/查询参数/UA、请求 body、
+// 响应状态/Content-Type/body、耗时。不再记录 issues、hint、route、
+// backend_stage、warn-once、统计汇总等诊断信息。
+//
+// 注意：请求 body 和响应 body 会原样写入日志。对于 /api/user，响应 body
+// 就是 token，请求 body 可能包含 Puid/Username，因此日志文件属于敏感数据，
+// 必须限制访问权限。
 package gateway
 
 import (
+	// bytes 用于保存响应 body，以及在读取请求 body 后重新构造 r.Body。
+	"bytes"
+	// encoding/json 把访问记录序列化成一行 JSON。
 	"encoding/json"
-	"fmt"
+	// io 读取请求 body。
+	"io"
+	// log 输出最终的一行日志。
 	"log"
+	// net 拆分 RemoteAddr 的 host:port。
 	"net"
+	// net/http 提供 ResponseWriter、Request。
 	"net/http"
+	// net/netip 判断直连对端是否为回环地址。
 	"net/netip"
+	// strings 处理代理头和 X-Forwarded-For。
 	"strings"
+	// time 记录时间戳和耗时。
 	"time"
 )
 
-const (
-	levelInfo = iota
-	levelWarn
-	levelError
-)
-
-var levelNames = [...]string{"info", "warn", "error"}
-
-type requestLog struct {
-	http.ResponseWriter
-	fields  map[string]any
-	status  int
-	bytes   int
-	level   int
-	leveled bool
-	issues  []string
-	hints   []string
-	// serious and seriousHints only hold warnings and errors, they make up the readable line.
-	serious      []string
-	seriousHints []string
-	quiet        bool
+// accessLog 是每请求唯一的一条日志记录。
+type accessLog struct {
+	Time                string `json:"time"`
+	ClientIP            string `json:"client_ip"`
+	Peer                string `json:"peer"`
+	Method              string `json:"method"`
+	Path                string `json:"path"`
+	Query               string `json:"query"`
+	UserAgent           string `json:"user_agent"`
+	RequestContentType  string `json:"request_content_type"`
+	RequestBody         string `json:"request_body"`
+	Status              int    `json:"status"`
+	ResponseContentType string `json:"response_content_type"`
+	ResponseBody        string `json:"response_body"`
+	DurationMS          int64  `json:"duration_ms"`
 }
 
-func (w *requestLog) WriteHeader(status int) {
+// loggingResponseWriter 包装真正的 ResponseWriter，记录状态码和完整响应 body。
+type loggingResponseWriter struct {
+	http.ResponseWriter
+	status int
+	body   bytes.Buffer
+}
+
+// WriteHeader 只接受第一次写入的状态码，并转发给底层 ResponseWriter。
+func (w *loggingResponseWriter) WriteHeader(status int) {
 	if w.status != 0 {
 		return
 	}
@@ -42,72 +63,52 @@ func (w *requestLog) WriteHeader(status int) {
 	w.ResponseWriter.WriteHeader(status)
 }
 
-func (w *requestLog) Write(p []byte) (int, error) {
+// Write 把响应同时写给客户端和内存缓冲区。
+func (w *loggingResponseWriter) Write(p []byte) (int, error) {
 	if w.status == 0 {
 		w.WriteHeader(http.StatusOK)
 	}
 	n, err := w.ResponseWriter.Write(p)
-	w.bytes += n
-	if err != nil {
-		w.fields["write_error"] = classifyError(err)
-	}
+	// 只记录真正写出的部分，避免底层写失败时日志与客户端收到的内容不一致。
+	w.body.Write(p[:n])
 	return n, err
 }
 
-func (w *requestLog) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+// Unwrap 让 http.ResponseController 能拿到底层 ResponseWriter。
+func (w *loggingResponseWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
-func setLogField(w *requestLog, key string, value any) {
-	w.fields[key] = value
+// readRequestBody 读取完整请求 body，并把读到的内容重新放回 r.Body，
+// 保证后续业务代码仍然能正常读取。
+//
+// 这里故意不限制大小：调用方要求记录完整 body。代价是超大请求会占用内存，
+// 生产环境应根据可接受的日志体积增加上限。
+func readRequestBody(r *http.Request) string {
+	if r.Body == nil {
+		return ""
+	}
+	data, _ := io.ReadAll(r.Body)
+	_ = r.Body.Close()
+	r.Body = io.NopCloser(bytes.NewReader(data))
+	return string(data)
 }
 
-// issue records a named problem of the request together with a hint telling the operator what to check.
-// Warnings and errors are additionally printed as one readable line next to the JSON record.
-func issue(w *requestLog, level int, code, hint string) {
-	if !w.leveled || level > w.level {
-		w.level = level
+// clientIP 返回日志中的 client_ip：优先使用可信代理传来的真实 IP，
+// 否则使用 TCP 直连对端的 IP。
+func clientIP(r *http.Request) string {
+	if forwarded := forwardedClient(r); forwarded != "" {
+		return forwarded
 	}
-	w.leveled = true
-	w.issues = append(w.issues, code)
-	if level >= levelWarn {
-		w.serious = append(w.serious, code)
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
 	}
-	if hint != "" {
-		w.hints = append(w.hints, hint)
-		if level >= levelWarn {
-			w.seriousHints = append(w.seriousHints, hint)
-		}
-	}
+	return host
 }
 
-func (g *gateway) firstTime(key string) bool {
-	_, seen := g.shownOnce.LoadOrStore(key, true)
-	return !seen
-}
-
-// warnOnceThenInfo reports a repeating problem as a warning the first time and as info afterwards.
-func (g *gateway) warnOnceThenInfo(w *requestLog, key, code, hint string) {
-	if g.firstTime(key) {
-		issue(w, levelWarn, code, hint+warnOnceNote)
-		return
-	}
-	issue(w, levelInfo, code, hint)
-}
-
-func quiet(w *requestLog) {
-	w.quiet = true
-}
-
-func truncate(s string, n int) string {
-	if i := strings.IndexAny(s, "\r\n"); i >= 0 {
-		s = s[:i]
-	}
-	if r := []rune(s); len(r) > n {
-		return string(r[:n]) + "…"
-	}
-	return s
-}
-
-// forwardedClient reads the client address set by a reverse proxy, only when the direct peer is local.
+// forwardedClient 读取反向代理设置的真实客户端 IP。
+//
+// 只有当直连对端是本机回环地址时才信任 X-Real-IP / X-Forwarded-For，
+// 否则玩家可以伪造这些头来污染日志。
 func forwardedClient(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
@@ -117,105 +118,51 @@ func forwardedClient(r *http.Request) string {
 		return ""
 	}
 	if v := strings.TrimSpace(r.Header.Get("X-Real-IP")); v != "" {
-		return truncate(v, 64)
+		return v
 	}
 	if v := r.Header.Get("X-Forwarded-For"); v != "" {
-		return truncate(strings.TrimSpace(strings.Split(v, ",")[0]), 64)
+		return strings.TrimSpace(strings.Split(v, ",")[0])
 	}
 	return ""
 }
 
+// logRequests 返回包装了访问日志的 http.Handler。
+//
+// 流程：
+//  1. 读取并恢复请求 body；
+//  2. 用 loggingResponseWriter 记录响应状态和 body；
+//  3. 调用 g.serve 处理业务；
+//  4. 请求结束后输出一行 JSON。
 func (g *gateway) logRequests() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		id := fmt.Sprintf("%x-%d", g.requestEpoch, g.requestSeq.Add(1))
-		w.Header().Set("X-Request-ID", id)
-		rw := &requestLog{ResponseWriter: w, fields: map[string]any{
-			"event": "http_request", "request_id": id, "method": r.Method,
-			"path": r.URL.Path, "peer": r.RemoteAddr, "content_type": r.Header.Get("Content-Type"),
-			"content_length": r.ContentLength, "authorization_present": r.Header.Get("Authorization") != "",
-			"response_source": "gateway", "host": truncate(r.Host, 100), "user_agent": truncate(r.UserAgent(), 160),
-		}}
-		if client := forwardedClient(r); client != "" {
-			rw.fields["forwarded_client"] = client
-		}
+		requestBody := readRequestBody(r)
+		lrw := &loggingResponseWriter{ResponseWriter: w}
+
+		// 即使业务处理 panic，也先写下这条访问日志；panic 随后仍由 net/http 处理。
 		defer func() {
-			if rw.status == 0 {
-				rw.status = 200
+			if lrw.status == 0 {
+				lrw.status = http.StatusOK
 			}
-			if !rw.leveled {
-				switch {
-				case rw.status >= 500:
-					rw.level = levelError
-				case rw.status >= 400:
-					rw.level = levelWarn
-				}
+			entry := accessLog{
+				Time:                time.Now().Format(time.RFC3339Nano),
+				ClientIP:            clientIP(r),
+				Peer:                r.RemoteAddr,
+				Method:              r.Method,
+				Path:                r.URL.Path,
+				Query:               r.URL.RawQuery,
+				UserAgent:           r.UserAgent(),
+				RequestContentType:  r.Header.Get("Content-Type"),
+				RequestBody:         requestBody,
+				Status:              lrw.status,
+				ResponseContentType: lrw.Header().Get("Content-Type"),
+				ResponseBody:        lrw.body.String(),
+				DurationMS:          time.Since(start).Milliseconds(),
 			}
-			rw.fields["status"] = rw.status
-			rw.fields["level"] = levelNames[rw.level]
-			rw.fields["response_bytes"] = rw.bytes
-			rw.fields["duration_ms"] = time.Since(start).Milliseconds()
-			if len(rw.issues) > 0 {
-				rw.fields["issues"] = rw.issues
-			}
-			if len(rw.hints) > 0 {
-				rw.fields["hint"] = strings.Join(rw.hints, "；")
-			}
-			g.stats.record(rw)
-			if rw.quiet && rw.status < 400 {
-				return
-			}
-			logEvent(rw.fields)
-			if rw.level >= levelWarn {
-				hint := strings.Join(rw.seriousHints, "；")
-				if hint == "" {
-					hint = "详见同一 request_id 的 JSON 记录"
-				}
-				codes := strings.Join(rw.serious, ",")
-				if codes == "" {
-					codes = "http_" + fmt.Sprint(rw.status)
-				}
-				log.Printf("[%s] %s %s %s -> %d %s: %s", strings.ToUpper(levelNames[rw.level]), id, r.Method, r.URL.Path, rw.status, codes, hint)
-			}
+			data, _ := json.Marshal(entry)
+			log.Print(string(data))
 		}()
-		g.serve(rw, r)
+
+		g.serve(lrw, r)
 	})
-}
-
-func logVersion(w *requestLog, version int64) {
-	setLogField(w, "client_version", version)
-	setLogField(w, "normalized_version", normalizeVersion(version))
-	if version >= minRawVersion && version <= maxVersion {
-		setLogField(w, "client_version_text", formatVersion(normalizeVersion(version)))
-		if normalizeVersion(version) != version {
-			setLogField(w, "disable_server_authority_flag", true)
-		}
-	}
-}
-
-func logBackend(w *requestLog, b *Backend) {
-	setLogField(w, "backend", b.Name)
-	setLogField(w, "backend_endpoint", b.HTTPEndpoint)
-	setLogField(w, "public_ip", b.PublicIP)
-	setLogField(w, "public_port", b.PublicPort)
-}
-
-func (g *gateway) logRoute(w *requestLog, r routeResult) {
-	setLogField(w, "route", r.kind)
-	if r.backend == nil {
-		return
-	}
-	logBackend(w, r.backend)
-	if r.kind != routeExact {
-		setLogField(w, "backend_range", r.backend.rangeText())
-		g.warnOnceThenInfo(w, "route:"+r.kind+":"+versionText(r.normalized), "version_"+r.kind, hintRoute(g.config, r))
-	}
-}
-
-// logEvent writes one JSON object with a timestamp field. Run disables the standard
-// log prefix, so collectors can parse every line as JSON.
-func logEvent(fields map[string]any) {
-	fields["time"] = time.Now().Format(time.RFC3339Nano)
-	data, _ := json.Marshal(fields)
-	log.Print(string(data))
 }

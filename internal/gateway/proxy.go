@@ -1,3 +1,8 @@
+// 本文件负责“网关 -> Impostor 后端”的 HTTP 交互：
+// 发送请求、改写地址、转换错误，以及对老后端缺失的接口代答。
+//
+// 日志已经移出业务逻辑：这里只返回响应，不再记录 backend_stage、
+// error_kind、issue 等诊断字段。
 package gateway
 
 import (
@@ -8,17 +13,16 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 )
 
+// 两个哨兵错误：调用方用 errors.Is 判断具体失败原因。
 var errRedirect = errors.New("backend redirect refused")
 
 var errInvalidPayload = errors.New("invalid backend payload")
 
-// failureKind classifies why a backend request failed. It is a distinct type so
-// hints and logs cannot silently disagree about a string constant.
+// failureKind 是健康状态里保存的失败分类。
 type failureKind string
 
 const (
@@ -31,6 +35,7 @@ const (
 	kindInvalidJSON       failureKind = "invalid_json"
 )
 
+// classifyError 把任意 error 归类成稳定的 failureKind。
 func classifyError(err error) failureKind {
 	if errors.Is(err, errRedirect) {
 		return kindRedirect
@@ -60,11 +65,9 @@ func classifyError(err error) failureKind {
 	return failureKind(fmt.Sprintf("%T", err))
 }
 
-// sendBackendRequest makes one request to a backend and feeds the result into the health monitor.
-func (g *gateway) sendBackendRequest(w *requestLog, r *http.Request, b *Backend, method, target string) (*http.Response, []byte, error) {
+// sendBackendRequest 向后端发送一次请求，并把结果同步给健康检查器。
+func (g *gateway) sendBackendRequest(r *http.Request, b *Backend, method, target string) (*http.Response, []byte, error) {
 	start := time.Now()
-	defer func() { setLogField(w, "backend_duration_ms", time.Since(start).Milliseconds()) }()
-	setLogField(w, "backend_stage", "request_build")
 	req, err := http.NewRequestWithContext(r.Context(), method, b.HTTPEndpoint+target, nil)
 	if err != nil {
 		return nil, nil, err
@@ -73,42 +76,35 @@ func (g *gateway) sendBackendRequest(w *requestLog, r *http.Request, b *Backend,
 	if auth := r.Header.Get("Authorization"); auth != "" {
 		req.Header.Set("Authorization", auth)
 	}
-	req.Header.Set("X-Request-ID", w.Header().Get("X-Request-ID"))
-	setLogField(w, "backend_stage", "request_send")
+
 	response, err := g.client.Do(req)
 	if err != nil {
+		// 玩家主动断开时不把失败记到后端健康状态上。
 		if r.Context().Err() == nil {
-			g.health.record(b, err, time.Since(start), "request")
-		} else {
-			setLogField(w, "client_canceled", true)
+			g.health.record(b, err, time.Since(start))
 		}
 		return nil, nil, err
 	}
 	defer response.Body.Close()
-	setLogField(w, "backend_status", response.StatusCode)
-	setLogField(w, "backend_stage", "response_read")
+
 	data, err := io.ReadAll(io.LimitReader(response.Body, 8<<20))
-	elapsed := time.Since(start)
-	g.health.record(b, err, elapsed, "request")
+	g.health.record(b, err, time.Since(start))
 	if err != nil {
 		return nil, nil, err
-	}
-	if limit := time.Duration(g.config.BackendTimeoutMS) * time.Millisecond / 2; elapsed > limit {
-		issue(w, levelWarn, "backend_slow", hintBackendSlow(b, elapsed, g.config.BackendTimeoutMS))
 	}
 	return response, data, nil
 }
 
-func (g *gateway) backendFailure(w *requestLog, b *Backend, isGameLookup bool, err error) {
-	setLogField(w, "error_kind", classifyError(err))
-	issue(w, levelError, "backend_unavailable", hintBackendUnavailable(b, err, g.config.BackendTimeoutMS))
+// backendFailure 对客户端统一返回 502。
+func (g *gateway) backendFailure(w http.ResponseWriter, isGameLookup bool) {
 	writeGameErrorResponse(w, isGameLookup, 502, reasonError, "Matchmaking backend unavailable")
 }
 
-// serveCreateGame hands out the configured address of the backend, after checking that the backend accepts a new game.
-func (g *gateway) serveCreateGame(w *requestLog, r *http.Request, b *Backend) {
+// serveCreateGame 处理 PUT /api/games（创建房间）。
+// 网关返回配置中的公网地址，而不是后端自报的地址。
+func (g *gateway) serveCreateGame(w http.ResponseWriter, r *http.Request, b *Backend) {
 	if g.config.ProbeBackendOnCreate {
-		response, data, err := g.sendBackendRequest(w, r, b, http.MethodPut, "/api/games")
+		response, data, err := g.sendBackendRequest(r, b, http.MethodPut, "/api/games")
 		if err == nil && (response.StatusCode < 200 || response.StatusCode >= 300) {
 			err = fmt.Errorf("%w: status %d", errInvalidPayload, response.StatusCode)
 		}
@@ -122,138 +118,94 @@ func (g *gateway) serveCreateGame(w *requestLog, r *http.Request, b *Backend) {
 		}
 		if err != nil {
 			if response != nil {
-				issue(w, levelError, "backend_rejected_create", hintBackendRejectedCreate(b, response.StatusCode))
-				setLogField(w, "error_kind", classifyError(err))
 				writeGameErrorResponse(w, false, 502, reasonError, "Matchmaking backend unavailable")
 				return
 			}
-			g.backendFailure(w, b, false, err)
+			g.backendFailure(w, false)
 			return
 		}
-		g.checkReportedAddress(w, b, host.Ip, host.Port)
-	} else if g.health.isDown(b) {
-		issue(w, levelWarn, "backend_marked_down", hintBackendMarkedDown(b))
 	}
-	setLogField(w, "response_source", "gateway")
+
 	writeJSON(w, 200, map[string]any{"Ip": b.encodedIP, "Port": b.PublicPort})
 }
 
-// checkReportedAddress compares the PublicIp/PublicPort a backend reports with the gateway configuration.
-func (g *gateway) checkReportedAddress(w *requestLog, b *Backend, ip, port json.Number) {
-	reportedIP, ipErr := ip.Int64()
-	reportedPort, portErr := port.Int64()
-	if ipErr != nil || portErr != nil {
-		return
-	}
-	address := fmt.Sprintf("%d.%d.%d.%d", reportedIP&0xff, reportedIP>>8&0xff, reportedIP>>16&0xff, reportedIP>>24&0xff)
-	setLogField(w, "backend_reported_address", fmt.Sprintf("%s:%d", address, reportedPort))
-	if uint32(reportedIP) == b.encodedIP && int(reportedPort) == b.PublicPort {
-		return
-	}
-	g.warnOnceThenInfo(w, fmt.Sprintf("address:%s:%s:%d", b.Name, address, reportedPort), "backend_public_address_mismatch",
-		hintBackendAddressMismatch(b, address, reportedPort))
-}
-
-func (g *gateway) proxy(w *requestLog, r *http.Request, b *Backend, legacyJoin, isGameLookup bool) {
+// proxy 把查询类请求转发给后端，并改写成功响应里的房间地址。
+func (g *gateway) proxy(w http.ResponseWriter, r *http.Request, b *Backend, legacyJoin, isGameLookup bool) {
 	target := r.URL.EscapedPath()
 	if r.URL.RawQuery != "" {
 		target += "?" + r.URL.RawQuery
 	}
-	response, data, err := g.sendBackendRequest(w, r, b, r.Method, target)
+
+	response, data, err := g.sendBackendRequest(r, b, r.Method, target)
 	if err != nil {
-		g.backendFailure(w, b, isGameLookup, err)
+		g.backendFailure(w, isGameLookup)
 		return
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		g.backendError(w, r, b, response.StatusCode, data, legacyJoin, isGameLookup)
+		g.backendError(w, r, response.StatusCode, data, legacyJoin, isGameLookup)
 		return
 	}
+
 	payload, err := decodeJSON(data)
 	if err == nil {
-		setLogField(w, "backend_stage", "response_rewrite")
 		err = rewrite(r.URL.Path, payload, b, legacyJoin)
 	}
 	if err != nil {
-		g.backendFailure(w, b, isGameLookup, fmt.Errorf("%w: %v", errInvalidPayload, err))
+		g.backendFailure(w, isGameLookup)
 		return
 	}
-	setLogField(w, "backend_stage", "complete")
-	setLogField(w, "response_source", "backend")
 	writeJSON(w, 200, payload)
 }
 
-// backendError answers a non-success backend response. Only the error reasons are passed on: Impostor puts
-// exception text into Message. Endpoints an older backend does not have are answered by the gateway.
-func (g *gateway) backendError(w *requestLog, r *http.Request, b *Backend, status int, data []byte, legacyJoin, isGameLookup bool) {
-	setLogField(w, "backend_stage", "http_error")
-	setLogField(w, "backend_body_bytes", len(data))
-	reasons, messages := parseBackendErrors(data)
+// backendError 处理后端返回的非 2xx 响应。
+// 只把 Errors[].Reason 转给客户端，丢弃 Impostor 的异常文本。
+func (g *gateway) backendError(w http.ResponseWriter, r *http.Request, status int, data []byte, legacyJoin, isGameLookup bool) {
+	reasons := parseBackendErrors(data)
 	if len(reasons) > 0 {
-		setLogField(w, "backend_reasons", reasons)
-		if len(messages) > 0 {
-			setLogField(w, "backend_message", strings.Join(messages, " | "))
-		}
-		if status == 404 && len(reasons) == 1 && reasons[0] == json.Number(strconv.Itoa(reasonGameNotFound)) {
-			issue(w, levelInfo, "game_not_found", hintGameNotFound(b))
-		} else {
-			issue(w, levelWarn, "backend_error", hintBackendError(b, status, reasons, messages))
-		}
-		setLogField(w, "response_source", "backend")
 		writeJSON(w, status, errorBody(isGameLookup, reasons...))
 		return
 	}
-	// ASP.NET answers a route it does not have with an empty 404/405, an HTML page means something else answered.
+
+	// 老版本 Impostor 对不存在的路由返回空 404/405。
 	if status == 404 || status == 405 {
-		endpoint := endpointName(r.URL.Path)
 		body, code, known := missingEndpointAnswer(r.URL.Path, legacyJoin, isGameLookup)
 		if known || len(bytes.TrimSpace(data)) == 0 {
 			if !known {
 				body, code = errorBody(isGameLookup, reasonError), status
 			}
-			g.warnOnceThenInfo(w, "missing:"+b.Name+":"+r.Method+":"+endpoint, "backend_endpoint_missing", hintMissingEndpoint(b, r.Method, endpoint, known))
-			setLogField(w, "response_source", "gateway")
 			writeJSON(w, code, body)
 			return
 		}
 	}
-	issue(w, levelError, "backend_error_unparsed", hintBackendErrorUnparsed(b, status, len(data)))
+
 	if status < 400 {
 		status = 502
 	}
 	writeJSON(w, status, errorBody(isGameLookup, reasonError))
 }
 
-// parseBackendErrors extracts only the fields the gateway forwards and logs: Reason values and
-// the first line of Message, which is never sent to the client.
-func parseBackendErrors(data []byte) (reasons []any, messages []string) {
+// parseBackendErrors 只提取 Errors[].Reason，忽略 Message。
+func parseBackendErrors(data []byte) []any {
 	payload, err := decodeJSON(data)
 	if err != nil {
-		return nil, nil
+		return nil
 	}
 	object, ok := payload.(map[string]any)
 	if !ok {
-		return nil, nil
+		return nil
 	}
 	list, _ := object["Errors"].([]any)
+	var reasons []any
 	for _, item := range list {
 		entry, _ := item.(map[string]any)
 		if reason, ok := entry["Reason"].(json.Number); ok {
 			reasons = append(reasons, reason)
 		}
-		if message, ok := entry["Message"].(string); ok && message != "" {
-			messages = append(messages, truncate(message, 160))
-		}
 	}
-	return reasons, messages
+	return reasons
 }
 
-func endpointName(path string) string {
-	if strings.HasPrefix(path, "/api/games/") && path != "/api/games/filtered" {
-		return "/api/games/{gameId}"
-	}
-	return path
-}
-
+// missingEndpointAnswer 决定“后端没有这个接口”时网关如何代答。
 func missingEndpointAnswer(path string, legacyJoin, isGameLookup bool) (any, int, bool) {
 	switch {
 	case isGameLookup:

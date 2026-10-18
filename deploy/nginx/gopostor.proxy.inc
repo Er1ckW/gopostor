@@ -13,7 +13,7 @@ proxy_set_header Connection "";
 proxy_set_header Host $host;
 # Nginx forwards Authorization by default, set explicitly because gopostor needs the matchmaking token.
 proxy_set_header Authorization $http_authorization;
-# Shown as forwarded_client in gopostor's log, gopostor only trusts it from 127.0.0.1.
+# Shown as client_ip in gopostor's log; gopostor only trusts it from 127.0.0.1.
 proxy_set_header X-Real-IP $remote_addr;
 proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
 proxy_set_header X-Forwarded-Proto $scheme;

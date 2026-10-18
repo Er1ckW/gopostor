@@ -74,14 +74,14 @@ serve（handler.go）判断路径和方法
 
 按顺序读：
 
-1. [`cmd/gopostor/main.go`](cmd/gopostor/main.go)：入口逻辑很短，看它如何调用 `gateway.Run()` 并把错误变成退出码。
+1. [`cmd/gopostor/main.go`](cmd/gopostor/main.go)：入口逻辑很短，看它如何解析 `-config`/`-debug`、把退出信号变成 ctx，再调用 `gateway.Run` 并把错误变成退出码。
 2. [`internal/gateway/app.go`](internal/gateway/app.go)：重点看 `Run()`。
 
 读 `Run()` 时带着这几个问题：
 
-- `flag.String` / `flag.Parse` 如何解析 `-config`？
+- `main.go` 里的 `flag.String` / `flag.Bool` / `flag.Parse` 如何解析 `-config` 和 `-debug`？为什么把参数解析和信号处理放在 main，而让 `Run` 只接收 `ctx` 和 `Options`？（提示：看 `app_test.go` 如何直接启动并取消 `Run`。）
 - `http.Server` 的五个字段分别是什么？为什么要设 `ReadHeaderTimeout`、`ReadTimeout`、`IdleTimeout`？
-- `signal.NotifyContext` 如何把 Ctrl+C / SIGTERM 变成 `ctx.Done()`？
+- `main.go` 里的 `signal.NotifyContext` 如何把 Ctrl+C / SIGTERM 变成 `ctx.Done()`？
 - 健康检查为什么单独用一个 `go func()`？
 - `Shutdown` 和 `Close` 的区别是什么？`done` channel 为什么存在？
 - `ListenAndServe` 为什么把 `http.ErrServerClosed` 当成正常结束？
@@ -135,7 +135,7 @@ serve（handler.go）判断路径和方法
 
 - `classifyError` 的判断顺序为什么重要？`errors.Is` 和 `errors.As` 各解决什么问题？
 - `sendBackendRequest` 如何继承客户端 context？为什么 `client.Do` 失败时要检查客户端 context 再更新后端健康状态？
-- `serveCreateGame` 的探测流程：什么情况算"后端拒绝创建"？什么情况算"连接失败"？
+- `serveCreateGame` 的探测流程：什么情况算"后端拒绝创建"（透传 Reason）？什么情况算"连接失败"（502）？
 - 创建探测为什么只检查后端返回的状态和 `Ip`/`Port` 字段，而最终始终返回配置地址？
 - `proxy` 为什么用 `EscapedPath` 而不是 `Path`？
 - `rewrite` 如何区分 `Ip`、`IP`、`Game`、`games` 这几种 JSON 形状？
@@ -147,14 +147,15 @@ serve（handler.go）判断路径和方法
 
 1. [`internal/gateway/health.go`](internal/gateway/health.go)
 2. [`internal/gateway/logging.go`](internal/gateway/logging.go)
+3. [`internal/gateway/redact.go`](internal/gateway/redact.go)
 
-- 健康检查为什么"任何 HTTP 响应都算可达"？Impostor 1.9.x 根路径返回 404 说明了什么？
-- `record` 为什么只更新状态、不再打日志？`Failures`/`LastError` 如何供 `/healthz` 使用？
+- 健康检查为什么 4xx 算可达、5xx 算失败？Impostor 1.9.x 根路径返回 404 说明了什么？
+- `record` 为什么要连续失败 `healthFailureThreshold` 次才把 up 改成 down，而 unknown 第一次失败就判 down？`Failures`/`LastError` 如何供 `/healthz` 使用？
 - `readRequestBody` 如何用 `http.MaxBytesReader` 限制读取大小，并只在读取成功后用 `io.NopCloser` 放回去？为什么不能忽略读取错误？
 - `authorization_token` 如何把 Base64 token 展开成 JSON？如何从中查看 `Content.ClientVersion`？
-- `loggingResponseWriter` 如何同时写客户端和内存缓冲区？
+- `loggingResponseWriter` 如何同时写客户端和内存缓冲区？非 debug 模式下 `limit` 如何限制缓存大小？
 - `client_ip` 和 `peer` 有什么区别？`forwardedClient` 为什么只信任本机代理传来的 `X-Real-IP`？
-- 记录完整请求/响应 body 有什么隐私和内存风险？
+- 记录完整请求/响应 body 有什么隐私和内存风险？`redactValue` 如何递归脱敏 JSON，为什么非 JSON body 只记录长度？
 
 ### 第 7 站：用测试反推行为
 
@@ -164,9 +165,10 @@ serve（handler.go）判断路径和方法
 |---|---|---|
 | [`config_test.go`](internal/gateway/config_test.go) | config.go / version.go / routing.go | 边界值、开放范围、严格字段、IPv4 字节序 |
 | [`token_test.go`](internal/gateway/token_test.go) | token.go | token 的逐字节格式、fuzz、benchmark |
-| [`handler_test.go`](internal/gateway/handler_test.go) | handler.go / proxy.go / health.go | 端到端流程、探测、错误清理、缺失接口 |
+| [`app_test.go`](internal/gateway/app_test.go) | app.go | 启动真实 HTTP 服务、取消 ctx 后优雅退出、配置缺失 |
+| [`handler_test.go`](internal/gateway/handler_test.go) | handler.go / proxy.go / health.go | 端到端流程、探测与 Reason 透传、错误清理、缺失接口、健康失败阈值 |
 | [`proxy_test.go`](internal/gateway/proxy_test.go) | proxy.go | 错误分类表驱动测试 |
-| [`logging_test.go`](internal/gateway/logging_test.go) | logging.go / token.go | 日志字段、body 大小边界与读取错误、解码后的 token、client_ip |
+| [`logging_test.go`](internal/gateway/logging_test.go) | logging.go / redact.go / token.go | 日志字段、默认脱敏与 -debug 完整记录、body 大小边界与读取错误、解码后的 token、client_ip |
 | [`helpers_test.go`](internal/gateway/helpers_test.go) | logging.go | 代理头信任规则 |
 
 读测试时注意几个 Go 测试惯用法：
@@ -194,6 +196,7 @@ serve（handler.go）判断路径和方法
 | `response.go` | JSON 错误体、IP/Port 改写 | `writeJSON`、`rewrite` |
 | `health.go` | 后端健康状态机 | `record`、`check`、`snapshot` |
 | `logging.go` | 单行 JSON 访问日志、请求体限额和 token 展示 | `logRequests`、`readRequestBody`、`loggingResponseWriter` |
+| `redact.go` | 默认模式下 body 和 token 的脱敏 | `redactBody`、`redactJSON`、`redactValue` |
 
 ---
 
@@ -267,25 +270,27 @@ Impostor 1.9.x 不认识 16.0 之后客户端使用的新接口，ASP.NET 会返
 
 配置错误通常很难在运行时发现：比如把 `backendTimeoutMs` 写成 `backendTimeoutMillis`，如果静默忽略，程序会用默认值继续跑，问题被掩盖。`DisallowUnknownFields` 让拼写错误在启动时立刻失败；未知字段、重叠范围、非法 IP/端口、带路径的 endpoint 都会拒绝启动。
 
-### 5.9 为什么健康检查"任何 HTTP 响应都算可达"？
+### 5.9 为什么健康检查 4xx 算可达、5xx 算失败？
 
-因为 Impostor 1.9.x 的根路径没有 handler，会返回 404。404 说明"服务器活着，只是没有这个路由"。实现上以 `http.Client.Do` 是否返回错误为准：连接拒绝、超时、DNS 失败等会标为 down；客户端拒绝跟随重定向，因此重定向也会记为失败。这只检查 HTTP 可达性，不保证 UDP 游戏服务正常。
+因为 Impostor 1.9.x 的根路径没有 handler，会返回 404。404 说明"服务器活着，只是没有这个路由"。5xx 则说明后端进程本身出了问题，所以记为失败（`last_error` 为 `server_error`）。连接拒绝、超时、DNS 失败等同样是失败；客户端拒绝跟随重定向，因此重定向也会记为失败。
 
-### 5.10 为什么访问日志要记录完整 body？
+已经 up 的后端要连续失败 `healthFailureThreshold`（默认 3）次才判为 down，避免一次偶发超时让 `/healthz` 在 200 和 503 之间抖动；还没成功过的后端第一次失败就判 down。这只检查 HTTP 可达性，不保证 UDP 游戏服务正常。
 
-当前实现按“简单访问日志”的目标，把请求和响应 body 原样写进一行 JSON，方便直接看到客户端发了什么、服务器回了什么。
+### 5.10 访问日志为什么分默认和 -debug 两种模式？
+
+带 `-debug` 启动时，日志把请求和响应 body 原样写进一行 JSON，方便直接看到客户端发了什么、服务器回了什么。默认模式下，`redact.go` 会先脱敏：`Puid` 只保留前 4 个字符，玩家名字类字段替换为 `***`，非 JSON body（如 token）和超过 16KB 的 body 只记录长度。下面描述的是 `-debug` 模式的完整记录。
 
 请求携带可解码的 Authorization token 时，同一行还会包含 `authorization_token` 对象，直接展示 `Content.ClientVersion`、`Puid`、`ExpiresAt` 和 `Hash`（具体字段取决于客户端 token）。缺失或无法解码时省略；它只是客户端上报的数据，不代表签名已验证。
 
 `client_ip` 是玩家来源 IP；`peer` 是直接连接网关的对端，通过本机 Nginx 时通常是 `127.0.0.1:临时源端口`。二进制 body 的单字节 `0x00` 会显示为 `"\u0000"`；非 UTF-8 字节可能被 JSON 编码替换，因此日志字符串不保证无损还原所有二进制数据。
 
-代价是：
+完整记录的代价是：
 
 - `/api/user` 的响应 body 就是 token，请求 body 可能包含 PUID/用户名，日志文件属于敏感数据；
 - 请求 body 在日志读取阶段限制为 64KB：超限返回 413 并只记录前 64KB；读取失败返回 400 并记录已收到的部分，均不会继续业务处理；大房间列表仍会占用内存和磁盘；
 - 日志量会明显大于只记录元信息的访问日志。
 
-如果部署在公网，应限制日志访问权限，并根据请求量设置日志轮转。
+所以 `-debug` 只应在排查问题时临时开启。无论哪种模式，部署在公网时都应限制日志访问权限，并根据请求量设置日志轮转。
 
 ### 5.11 并发安全体现在哪里？
 
@@ -355,7 +360,7 @@ go test ./internal/gateway -bench=. -benchmem
 1. 给访问日志增加 `request_id` 字段，并把它转发给后端，练习中间件和请求头。
 2. 为 `validGameID` 增加一个边界测试（例如 `-2147483648`、`2147483647`）。
 3. 给 `/` 增加一个返回版本号的接口（需要新增配置字段、日志字段和测试）。
-4. 为响应 body 日志增加可配置的大小上限和 `truncated` 标记（练习 `io.LimitReader` 和日志体积控制）。
+4. 把默认模式的 16KB body 上限改成可配置项（需要新增配置字段、校验和测试）。
 5. 实现"按后端名称过滤 `/healthz` 输出"（需要修改 `snapshot` 和 handler）。
 6. 尝试把 `healthMonitor` 的定时检查改成可动态调整间隔（需要新的并发控制）。
 
@@ -385,5 +390,5 @@ go test ./internal/gateway -bench=. -benchmem
 读完之后，如果你能不看代码回答下面三个问题，说明主线已经掌握了：
 
 1. 一个 `ClientVersion=50595575` 的客户端，`+25` 去掉后是多少？会路由到示例配置的哪个后端？
-2. `PUT /api/games` 在后端不可用、后端返回 500、关闭探测三种情况下分别返回什么？
+2. `PUT /api/games` 在后端不可用、后端返回 500、后端返回 `{"Errors":[{"Reason":5}]}`、关闭探测四种情况下分别返回什么？
 3. Impostor 1.9.x 对 `GET /api/games/filtered` 返回空 404 时，客户端最终收到什么？

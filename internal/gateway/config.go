@@ -57,6 +57,13 @@ type Backend struct {
 // Config 对应 config.json 的顶层结构。
 //
 // 字段上的注释既解释配置含义，也解释默认值从哪里来（见 parseConfig 的初始值）。
+// maxBackendTimeoutMS 是 backendTimeoutMs 允许的最大值（毫秒）。
+//
+// deploy/nginx 中的 proxy_read_timeout 是 15 秒：后端超时如果比它长，
+// Nginx 会先返回 504，网关自己的 502 和健康记录都不会生效。
+// 10 秒给 Nginx 和网关本身留出余量；调大这里时必须同时调大 Nginx 的超时。
+const maxBackendTimeoutMS = 10000
+
 type Config struct {
 	// Source 是可选的文档字段，用来记录版本范围来自哪个 Impostor 源码。
 	// 保留它是为了让旧示例配置仍能通过严格解析。
@@ -65,7 +72,7 @@ type Config struct {
 	// 通常监听 127.0.0.1，由前面的 Nginx 负责 HTTPS 和公网入口。
 	ListenIP   string `json:"listenIp"`
 	ListenPort int    `json:"listenPort"`
-	// BackendTimeoutMS 是单次后端请求的超时时间（毫秒）。
+	// BackendTimeoutMS 是单次后端请求的超时时间（毫秒），上限见 maxBackendTimeoutMS。
 	BackendTimeoutMS int `json:"backendTimeoutMs"`
 	// RejectUnknownVersions 控制"版本不在任何范围内"时如何处理游戏请求：
 	//   false（默认）：仍转给最近的后端，由 Impostor 告诉玩家该更新游戏还是服务器过旧；
@@ -75,6 +82,9 @@ type Config struct {
 	// 后端不可用就立即返回 502，玩家不用等到 UDP 连接超时才发现问题。
 	ProbeBackendOnCreate   bool `json:"probeBackendOnCreate"`
 	HealthCheckIntervalSec int  `json:"healthCheckIntervalSec"` // 后台健康检查间隔（秒），0 表示只在启动时检查
+	// HealthFailureThreshold 是已经 up 的后端连续失败多少次才判定为 down。
+	// 一次偶发超时不应让 /healthz 立刻变成 503；状态还是 unknown 时第一次失败就判 down。
+	HealthFailureThreshold int `json:"healthFailureThreshold"`
 	// StatsIntervalSec 已废弃：为兼容旧配置保留解析，当前版本不再输出统计汇总。
 	StatsIntervalSec int       `json:"statsIntervalSec"`
 	Backends         []Backend `json:"backends"` // 至少一个后端；解析后会按版本下限升序排序
@@ -101,7 +111,7 @@ func (b *Backend) rangeText() string {
 func parseConfig(data []byte) (Config, error) {
 	// 先填入默认值。JSON 中缺省的字段会保留这里的值；
 	// 显式写了 0/false 的字段则会被覆盖成 0/false（所以校验要区分"不写"和"写错"）。
-	c := Config{ListenIP: "127.0.0.1", ListenPort: 24000, BackendTimeoutMS: 5000, ProbeBackendOnCreate: true, HealthCheckIntervalSec: 30}
+	c := Config{ListenIP: "127.0.0.1", ListenPort: 24000, BackendTimeoutMS: 5000, ProbeBackendOnCreate: true, HealthCheckIntervalSec: 30, HealthFailureThreshold: 3}
 	// bytes.NewReader 把字节切片包装成流；json.NewDecoder 从流里逐个读取 JSON 值。
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	// 严格模式：JSON 里出现结构体没有定义的字段就返回错误。
@@ -127,8 +137,8 @@ func parseConfig(data []byte) (Config, error) {
 		return c, fmt.Errorf("listenPort must be between 1 and 65535")
 	}
 	// 后端超时限制在 1ms 到 120s 之间，避免配置成 0（永不超时）或过大。
-	if c.BackendTimeoutMS < 1 || c.BackendTimeoutMS > 120000 {
-		return c, fmt.Errorf("backendTimeoutMs must be between 1 and 120000")
+	if c.BackendTimeoutMS < 1 || c.BackendTimeoutMS > maxBackendTimeoutMS {
+		return c, fmt.Errorf("backendTimeoutMs must be between 1 and %d", maxBackendTimeoutMS)
 	}
 	// 没有任何后端时，所有游戏请求都无处可转，启动就没有意义。
 	if len(c.Backends) == 0 {
@@ -137,6 +147,10 @@ func parseConfig(data []byte) (Config, error) {
 	// 健康检查间隔允许为 0（表示只在启动时检查），但不能为负数。
 	if c.HealthCheckIntervalSec < 0 {
 		return c, fmt.Errorf("healthCheckIntervalSec must not be negative")
+	}
+
+	if c.HealthFailureThreshold < 1 || c.HealthFailureThreshold > 100 {
+		return c, fmt.Errorf("healthFailureThreshold must be between 1 and 100")
 	}
 	// 用一个 map 记录已出现的名字，顺便检查空名和重名。
 	names := map[string]bool{}

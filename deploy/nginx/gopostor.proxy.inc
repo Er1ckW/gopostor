@@ -21,7 +21,7 @@ proxy_set_header X-Forwarded-Proto $scheme;
 proxy_redirect off;
 proxy_buffering off;
 proxy_connect_timeout 3s;
-# Longer than backendTimeoutMs (5 s): gopostor answers itself when a backend is slow.
+# Longer than backendTimeoutMs (default 5 s, capped at 10 s): gopostor answers itself when a backend is slow.
 proxy_read_timeout 15s;
 proxy_send_timeout 15s;
 # Never retry matchmaking requests on another attempt, a PUT must not be sent twice.

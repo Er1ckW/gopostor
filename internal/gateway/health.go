@@ -39,11 +39,13 @@ type healthMonitor struct {
 	states   map[string]*backendState
 	backends []*Backend
 	client   *http.Client
+	// threshold 是 up 状态连续失败多少次后才切换到 down。
+	threshold int
 }
 
 // newHealthMonitor 为每个后端建立初始状态（unknown）。
 func newHealthMonitor(c *Config, client *http.Client) *healthMonitor {
-	m := &healthMonitor{states: map[string]*backendState{}, client: client}
+	m := &healthMonitor{states: map[string]*backendState{}, client: client, threshold: max(c.HealthFailureThreshold, 1)}
 	for i := range c.Backends {
 		b := &c.Backends[i]
 		m.backends = append(m.backends, b)
@@ -53,6 +55,9 @@ func newHealthMonitor(c *Config, client *http.Client) *healthMonitor {
 }
 
 // record 用一次检查/请求的结果更新后端状态。
+//
+// 失败时：状态还是 unknown（从没成功过）就直接判 down；已经 up 的后端要连续失败
+// threshold 次才判 down，避免一次偶发超时让 /healthz 抖动。成功一次就恢复 up。
 func (m *healthMonitor) record(b *Backend, err error, latency time.Duration) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -66,7 +71,7 @@ func (m *healthMonitor) record(b *Backend, err error, latency time.Duration) {
 	if err != nil {
 		s.Failures++
 		s.LastError = string(classifyError(err))
-		if s.State != stateDown {
+		if s.State == stateUnknown || (s.State == stateUp && s.Failures >= m.threshold) {
 			s.State, s.Since = stateDown, now
 		}
 		return
@@ -78,7 +83,7 @@ func (m *healthMonitor) record(b *Backend, err error, latency time.Duration) {
 }
 
 // check 对一个后端执行 GET /。
-// 只要返回了任何 HTTP 响应（包括 404）都算可达。
+// 返回 4xx（包括 404）也算可达；5xx 说明后端进程有问题，记为失败。
 func (m *healthMonitor) check(ctx context.Context, b *Backend) {
 	start := time.Now()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, b.HTTPEndpoint+"/", nil)
@@ -88,6 +93,7 @@ func (m *healthMonitor) check(ctx context.Context, b *Backend) {
 		if response, err = m.client.Do(req); err == nil {
 			_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 65536))
 			response.Body.Close()
+			err = serverStatusError(response.StatusCode)
 		}
 	}
 	if ctx.Err() != nil {

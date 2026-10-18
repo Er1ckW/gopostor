@@ -30,10 +30,11 @@ gopostor 是一个用 Go 标准库写的 Among Us / Impostor **HTTP 匹配网关
    ▼
 ┌─────────────────────────────────────────────────────┐
 │ logRequests 中间件（logging.go）                     │
-│ 读取请求 body、包装 ResponseWriter、开始计时          │
+│ 请求 body 限 64KB、包装 ResponseWriter、计时          │
 └─────────────────────────────────────────────────────┘
    │
    ▼
+读取超限 → 413；读取失败 → 400；成功才进入 serve
 serve（handler.go）判断路径和方法
    │
    ├── GET/HEAD /          → 返回固定存活文本
@@ -57,6 +58,7 @@ serve（handler.go）判断路径和方法
    │
    ▼
 响应写回客户端；logRequests 的 defer 输出一行访问日志
+（含可解码的 authorization_token、请求和响应内容）
    │
    ▼
 玩家拿到后端公网 IP + UDP 端口，游戏流量直接连后端
@@ -72,7 +74,7 @@ serve（handler.go）判断路径和方法
 
 按顺序读：
 
-1. [`cmd/gopostor/main.go`](cmd/gopostor/main.go)：只有十几行，看它如何调用 `gateway.Run()` 并把错误变成退出码。
+1. [`cmd/gopostor/main.go`](cmd/gopostor/main.go)：入口逻辑很短，看它如何调用 `gateway.Run()` 并把错误变成退出码。
 2. [`internal/gateway/app.go`](internal/gateway/app.go)：重点看 `Run()`。
 
 读 `Run()` 时带着这几个问题：
@@ -92,7 +94,7 @@ serve（handler.go）判断路径和方法
 
 这是全项目"数据基础"最集中的一段，建议慢慢读：
 
-- `Backend` 的六个导出字段和三个未导出字段分别做什么？`json:"..."` 标签如何工作？
+- `Backend` 的六个导出字段和四个未导出字段（`min`、`max`、`encodedIP`、`addr`）分别做什么？`json:"..."` 标签如何工作？
 - `parseConfig` 为什么先填默认值？`DisallowUnknownFields` 解决了什么问题？
 - 为什么 `publicIp` 必须是 IPv4？为什么 `httpEndpoint` 不允许带路径和查询参数？
 - `encodedIP` 的小端序是怎么算的？`127.0.0.1` 为什么等于 `16777343`？
@@ -106,15 +108,16 @@ serve（handler.go）判断路径和方法
 
 - `createToken` 生成的 JSON 长什么样？`ExpiresAt` 和 `Hash` 为什么是固定值？
 - `parseTokenVersion` 为什么只读 `Content.ClientVersion`，不校验 Puid 和 Hash？
+- `decodeTokenPayload` 如何供版本解析和访问日志共用？为什么解码成功不代表 token 已通过身份验证？
 - `flexibleInt` 为什么要兼容"数字"和"数字字符串"？
-- `serveToken` 里 `Puid`/`Username` 为什么用 `*string`？`Language` 为什么用 `json.RawMessage`？
-- 哪些字段缺失仍然签发 token？哪些错误必须返回 400？
+- `serveToken` 里 `Puid`/`Username` 为什么用 `*string`？`ClientVersion` 为什么用 `json.RawMessage`？为什么不再声明 `Language` 字段？
+- 哪些字段缺失仍然签发 token？哪些错误返回 400？为什么请求体超过 64KB 时由中间件先返回 413？
 
 ### 第 4 站：请求分发
 
 读 [`internal/gateway/handler.go`](internal/gateway/handler.go)：
 
-- `gateway` 结构体为什么只保留 `config`、`client`、`health` 三个字段？`config` 为什么指向一份副本？
+- `gateway` 结构体为什么只保留 `config`、`client`、`health` 三个字段？`Config` 值传递会复制哪些内容，为什么 `Backends` 切片的底层数组仍然共享？
 - `client` 为什么要统一设置超时并拒绝重定向？
 - `serve` 的 `w` 为什么是普通的 `http.ResponseWriter`，而不是日志包装器？
 - `serve` 如何判断路径、方法和房间码？
@@ -131,9 +134,9 @@ serve（handler.go）判断路径和方法
 这一段是业务核心，建议对照测试读：
 
 - `classifyError` 的判断顺序为什么重要？`errors.Is` 和 `errors.As` 各解决什么问题？
-- `sendBackendRequest` 如何继承客户端 context？为什么客户端取消时不记后端健康失败？
+- `sendBackendRequest` 如何继承客户端 context？为什么 `client.Do` 失败时要检查客户端 context 再更新后端健康状态？
 - `serveCreateGame` 的探测流程：什么情况算"后端拒绝创建"？什么情况算"连接失败"？
-- `checkReportedAddress` 为什么只警告、不改返回值？
+- 创建探测为什么只检查后端返回的状态和 `Ip`/`Port` 字段，而最终始终返回配置地址？
 - `proxy` 为什么用 `EscapedPath` 而不是 `Path`？
 - `rewrite` 如何区分 `Ip`、`IP`、`Game`、`games` 这几种 JSON 形状？
 - `backendError` 为什么只透传 `Reason`，丢弃 `Message`？
@@ -147,7 +150,8 @@ serve（handler.go）判断路径和方法
 
 - 健康检查为什么"任何 HTTP 响应都算可达"？Impostor 1.9.x 根路径返回 404 说明了什么？
 - `record` 为什么只更新状态、不再打日志？`Failures`/`LastError` 如何供 `/healthz` 使用？
-- `logRequests` 如何读取请求 body，并用 `io.NopCloser` 放回去？
+- `readRequestBody` 如何用 `http.MaxBytesReader` 限制读取大小，并只在读取成功后用 `io.NopCloser` 放回去？为什么不能忽略读取错误？
+- `authorization_token` 如何把 Base64 token 展开成 JSON？如何从中查看 `Content.ClientVersion`？
 - `loggingResponseWriter` 如何同时写客户端和内存缓冲区？
 - `client_ip` 和 `peer` 有什么区别？`forwardedClient` 为什么只信任本机代理传来的 `X-Real-IP`？
 - 记录完整请求/响应 body 有什么隐私和内存风险？
@@ -162,7 +166,7 @@ serve（handler.go）判断路径和方法
 | [`token_test.go`](internal/gateway/token_test.go) | token.go | token 的逐字节格式、fuzz、benchmark |
 | [`handler_test.go`](internal/gateway/handler_test.go) | handler.go / proxy.go / health.go | 端到端流程、探测、错误清理、缺失接口 |
 | [`proxy_test.go`](internal/gateway/proxy_test.go) | proxy.go | 错误分类表驱动测试 |
-| [`logging_test.go`](internal/gateway/logging_test.go) | logging.go | 访问日志字段、完整请求/响应 body、client_ip |
+| [`logging_test.go`](internal/gateway/logging_test.go) | logging.go / token.go | 日志字段、body 大小边界与读取错误、解码后的 token、client_ip |
 | [`helpers_test.go`](internal/gateway/helpers_test.go) | logging.go | 代理头信任规则 |
 
 读测试时注意几个 Go 测试惯用法：
@@ -170,7 +174,7 @@ serve（handler.go）判断路径和方法
 - `t.Run(name, func(t *testing.T){...})`：子测试，失败时能定位到具体用例。
 - `t.Helper()`：标记辅助函数，报错行号指向调用者。
 - `t.Cleanup(fn)`：测试结束时执行清理（关闭服务器、恢复日志输出）。
-- `httptest.NewServer` / `httptest.NewRequest` / `httptest.NewRecorder`：不用真实网络就能测 HTTP。
+- `httptest.NewRequest` / `httptest.NewRecorder`：直接调用 handler，无需网络；`httptest.NewServer` 会监听本机临时端口，模拟后端 HTTP 服务。
 - 表驱动测试：把输入和期望放进切片，循环断言。
 
 ---
@@ -185,11 +189,11 @@ serve（handler.go）判断路径和方法
 | `version.go` | 版本整数编码/解码、`+25` 标志 | `encodeVersion`、`normalizeVersion` |
 | `routing.go` | 按版本选择后端 | `route` |
 | `handler.go` | HTTP 路径/方法分发、房间码校验 | `serve` |
-| `token.go` | `/api/user`、token 签发与解析 | `serveToken`、`parseTokenVersion` |
+| `token.go` | `/api/user`、token 签发与解析 | `serveToken`、`parseTokenVersion`、`decodeTokenPayload` |
 | `proxy.go` | 请求后端、创建探测、错误分类、缺失接口代答 | `sendBackendRequest`、`backendError` |
 | `response.go` | JSON 错误体、IP/Port 改写 | `writeJSON`、`rewrite` |
 | `health.go` | 后端健康状态机 | `record`、`check`、`snapshot` |
-| `logging.go` | 单行 JSON 访问日志、完整 body 捕获 | `logRequests`、`loggingResponseWriter` |
+| `logging.go` | 单行 JSON 访问日志、请求体限额和 token 展示 | `logRequests`、`readRequestBody`、`loggingResponseWriter` |
 
 ---
 
@@ -229,7 +233,7 @@ Among Us 的匹配接口用 32 位整数表示 IPv4，而且字节序是小端�
 按小端序解释为 0x0100007F = 16777343
 ```
 
-所以 `config.go` 里用 `binary.LittleEndian.Uint32`，`proxy.go` 里用移位还原成点分十进制，两者必须一致。
+`config.go` 用 `binary.LittleEndian.Uint32` 预先算出 `encodedIP`，`proxy.go` 创建响应和 `response.go` 的地址改写直接使用这个值。
 
 ### 5.5 为什么每个响应都要改写 IP/Port？
 
@@ -241,7 +245,7 @@ Impostor 后端通常监听 `127.0.0.1` 或内网地址，它自报的 `PublicIp
 - 单房间：改写 `Game` 对象；
 - 旧版加入：改写 `Ip`/`Port`。
 
-后端自报地址与配置不一致时，只记录一次警告，仍然返回配置值。
+创建探测不再比较后端自报地址与配置，也不输出不一致警告；返回给玩家的地址始终来自配置。
 
 ### 5.6 为什么只透传 `Reason`，不传 `Message`？
 
@@ -265,11 +269,15 @@ Impostor 1.9.x 不认识 16.0 之后客户端使用的新接口，ASP.NET 会返
 
 ### 5.9 为什么健康检查"任何 HTTP 响应都算可达"？
 
-因为 Impostor 1.9.x 的根路径没有 handler，会返回 404。404 说明"服务器活着，只是没有这个路由"；只有连接拒绝、超时、DNS 失败等网络层错误才说明后端不可达。
+因为 Impostor 1.9.x 的根路径没有 handler，会返回 404。404 说明"服务器活着，只是没有这个路由"。实现上以 `http.Client.Do` 是否返回错误为准：连接拒绝、超时、DNS 失败等会标为 down；客户端拒绝跟随重定向，因此重定向也会记为失败。这只检查 HTTP 可达性，不保证 UDP 游戏服务正常。
 
 ### 5.10 为什么访问日志要记录完整 body？
 
 当前实现按“简单访问日志”的目标，把请求和响应 body 原样写进一行 JSON，方便直接看到客户端发了什么、服务器回了什么。
+
+请求携带可解码的 Authorization token 时，同一行还会包含 `authorization_token` 对象，直接展示 `Content.ClientVersion`、`Puid`、`ExpiresAt` 和 `Hash`（具体字段取决于客户端 token）。缺失或无法解码时省略；它只是客户端上报的数据，不代表签名已验证。
+
+`client_ip` 是玩家来源 IP；`peer` 是直接连接网关的对端，通过本机 Nginx 时通常是 `127.0.0.1:临时源端口`。二进制 body 的单字节 `0x00` 会显示为 `"\u0000"`；非 UTF-8 字节可能被 JSON 编码替换，因此日志字符串不保证无损还原所有二进制数据。
 
 代价是：
 
@@ -307,7 +315,7 @@ curl.exe -i http://127.0.0.1:24000/healthz
 
 # 4. 登录拿 token（PowerShell）
 $body = '{"Puid":"demo","Username":"demo","Language":0,"ClientVersion":50595550}'
-$token = Invoke-RestMethod -Method Post -Uri http://127.0.0.1:24000/api/user -Body $body
+$token = Invoke-RestMethod -Method Post -Uri http://127.0.0.1:24000/api/user -ContentType 'application/json' -Body $body
 $token
 
 # 5. 带 token 请求（后端没启动时会得到 502，这是预期）

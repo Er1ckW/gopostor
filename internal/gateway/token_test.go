@@ -57,13 +57,13 @@ func FuzzParseTokenVersion(f *testing.F) {
 
 // BenchmarkParseTokenVersion 测量解析一个合法 token 的耗时和内存分配。
 //
-// b.N 由测试框架动态决定：它会不断增加迭代次数，直到结果稳定。
+// b.Loop 由测试框架控制迭代次数：它会不断增加迭代次数，直到结果稳定。
 // 只有 go test -bench=. 才会运行基准测试，普通 go test 会跳过。
 func BenchmarkParseTokenVersion(b *testing.B) {
 	header := "Bearer " + createToken("player", 50595550)
 	// ReportAllocs 让输出包含每次操作的分配次数和字节数。
 	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		if _, err := parseTokenVersion(header); err != nil {
 			b.Fatal(err)
 		}

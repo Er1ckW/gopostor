@@ -187,7 +187,7 @@ func BenchmarkRoute(b *testing.B) {
 		b.Fatal(err)
 	}
 	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		if r := c.route(50663600); r.backend == nil {
 			b.Fatal("no backend")
 		}

@@ -6,7 +6,7 @@ Gopostor 是使用 Go 标准库编写的 Among Us / Impostor HTTP 匹配网关�
 
 ## 构建与运行
 
-在 gopostor 目录内执行（Go 1.22 或更高）：
+在 gopostor 目录内执行（Go 1.26 或更高；CI 在 1.26 和 1.27 上测试）：
 
 ```sh
 cp config.example.json config.json
@@ -18,6 +18,13 @@ go build -o gopostor ./cmd/gopostor
 Windows PowerShell 可用 `Copy-Item config.example.json config.json` 准备配置，使用 `go build -o gopostor.exe ./cmd/gopostor` 构建，再执行 `.\gopostor.exe -config config.json`。
 
 开发时也可在项目根目录执行 `go run ./cmd/gopostor -config config.json`。
+
+启动参数：
+
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `-config` | `config.json` | 配置文件路径 |
+| `-debug` | 关闭 | 访问日志记录完整的请求/响应 body 和解码后的 token；不加时只记录脱敏后的内容，见[访问日志](#访问日志) |
 
 默认配置路径是工作目录下的 `config.json`。配置在启动时加载，修改后重启。`config.example.json` 是纳入版本管理的示例；实际配置 `config.json` 已加入 `.gitignore`，部署时单独准备。
 
@@ -50,7 +57,7 @@ Remove-Item Env:GOOS, Env:GOARCH, Env:CGO_ENABLED -ErrorAction SilentlyContinue
 ├── config.example.json          # 配置示例，复制为 config.json 后修改
 ├── cmd/
 │   └── gopostor/
-│       └── main.go              # 命令行入口
+│       └── main.go              # 命令行入口、参数（-config/-debug）和退出信号
 ├── internal/gateway/
 │   ├── app.go                   # 启动、后台任务和优雅退出
 │   ├── config.go                # 配置加载、校验和派生数据计算
@@ -62,6 +69,7 @@ Remove-Item Env:GOOS, Env:GOARCH, Env:CGO_ENABLED -ErrorAction SilentlyContinue
 │   ├── response.go              # JSON 响应、错误响应和公网地址改写
 │   ├── health.go                # 后端健康检查和状态
 │   ├── logging.go               # 单行 JSON 访问日志
+│   ├── redact.go                # 默认模式的访问日志脱敏
 │   └── *_test.go                # 同包测试
 └── deploy/
     ├── nginx/                   # Nginx 配置示例
@@ -75,10 +83,11 @@ Remove-Item Env:GOOS, Env:GOARCH, Env:CGO_ENABLED -ErrorAction SilentlyContinue
 | 字段 | 默认值 | 说明 |
 |---|---|---|
 | `listenIp` / `listenPort` | `127.0.0.1` / `24000` | 网关监听地址，前面由 Nginx 提供 HTTPS |
-| `backendTimeoutMs` | `5000` | 单次后端请求超时 |
+| `backendTimeoutMs` | `5000` | 单次后端请求超时，范围 1–10000。上限低于 Nginx 的 `proxy_read_timeout 15s`，否则 Nginx 会先返回 504，网关的超时处理不会生效；调大上限时要同时调大 Nginx 超时 |
 | `rejectUnknownVersions` | `false` | 版本不在任何范围内时：`false` 转给最近的后端，由 Impostor 告诉玩家该更新游戏还是服务器过旧；`true` 时游戏请求直接返回 `404 Reason 5` |
 | `probeBackendOnCreate` | `true` | 创建房间前先向后端发送 `PUT /api/games`，后端不可用时立即返回错误，而不是让玩家等到 UDP 超时 |
 | `healthCheckIntervalSec` | `30` | 后台检查每个后端 `GET /` 的间隔，`0` 只在启动时检查 |
+| `healthFailureThreshold` | `3` | 已经 up 的后端连续失败多少次才判为 down（1–100）。从未成功过（unknown）的后端第一次失败就判 down；成功一次立即恢复 up。连接失败、超时和 5xx 都算失败，4xx 算可达 |
 | `backends[]` | | 每个后端的 `name`、`minVersion`、`maxVersion`、`publicIp`、`publicPort`、`httpEndpoint` |
 
 `statsIntervalSec` 已废弃：旧配置仍然可以解析，但当前版本不再输出统计汇总。
@@ -109,10 +118,10 @@ Remove-Item Env:GOOS, Env:GOARCH, Env:CGO_ENABLED -ErrorAction SilentlyContinue
 支持 POST /api/user、GET/PUT/POST /api/games、GET /api/games/{gameId}、GET /api/games/filtered、GET /api/filters、GET /api/filtertags；GET/HEAD / 是网关运行检查，GET/HEAD /healthz 返回各后端健康状态（有后端不可达时返回 503）。
 
 - **/api/user**：只要求有效的 `ClientVersion`（数字或数字字符串）。`Puid`、`Username`、`Language` 缺失或为空时照常签发 token，与 Impostor 一样使用 Base64 JSON、固定 Hash 和默认过期时间。token 不校验 EOS 签名。
-- **PUT /api/games**：先探测后端（见 `probeBackendOnCreate`），再返回配置中的公网地址；不会根据后端自报地址修改配置，也不输出地址不一致警告。
+- **PUT /api/games**：先探测后端（见 `probeBackendOnCreate`），再返回配置中的公网地址；不会根据后端自报地址修改配置，也不输出地址不一致警告。探测时后端返回 Impostor 格式的错误（`Errors[].Reason`，例如版本不匹配）会和查询类接口一样透传 Reason 和状态码；其他失败返回 `502 Reason 17`。
 - **查询类请求**：携带原 Authorization 转发给后端，并把返回的 IP/端口改写成配置值。
 - **后端错误**：只把 `Errors[].Reason` 转给客户端，丢弃 Impostor 写在 `Message` 里的异常文本。后端没有该接口（Impostor 1.9.x 对 16.0 以后的接口返回空 404）时，由网关返回空列表或"房间不存在"（Reason 3）。`GET /api/games/{id}` 的错误响应总是带 `"Game":null`。`/api/filtertags` 是例外：1.9.3 和 1.10.9 都没有实现它，网关返回 `404 Reason 17`，与旧行为一致。
-- **网关错误码**：token 缺失/无效 `401 Reason 11`；后端连接失败、超时、重定向或无效响应 `502 Reason 17`；房间码格式错误 `400 Reason 3`；请求体超限 `413 Reason 17`、读取失败 `400 Reason 17`（在业务校验之前返回）。
+- **网关错误码**：token 缺失/无效 `401 Reason 11`；后端连接失败、超时、重定向、无效响应或没有 Reason 的错误响应 `502 Reason 17`；房间码格式错误 `400 Reason 3`；请求体超限 `413 Reason 17`、读取失败 `400 Reason 17`（在业务校验之前返回）。
 
 **后端仍需正确处理房间列表的版本兼容性过滤，并保持 `Compatibility.AllowVersionMixing=false`。** Go 网关不替代后端的房间版本过滤。所有后端都必须启用内部 HTTP 服务。
 
@@ -139,6 +148,8 @@ curl --fail http://127.0.0.1:24000/healthz
 sudo journalctl -u gopostor.service -f
 ```
 
+服务文件启用了 systemd 沙箱（`ProtectSystem=strict`、`ProtectHome`、系统调用过滤、无任何 capability 等），网关只能读取文件、监听非特权端口。可用 `systemd-analyze security gopostor.service` 查看加固评分；如果改为监听 1024 以下端口，需要相应放开 `CapabilityBoundingSet`/`AmbientCapabilities`。
+
 更新二进制前停止服务，安装后再启动；保留服务器已修改的配置文件。只改配置时执行 `sudo systemctl restart gopostor.service`。服务异常退出后 5 秒重启，60 秒内最多启动 5 次；修复重复启动失败的原因后执行 `sudo systemctl reset-failed gopostor.service` 再启动。
 
 ## Nginx
@@ -162,7 +173,14 @@ sudo nginx -t && sudo systemctl reload nginx
 
 ## 访问日志
 
-所有日志写入 stderr，由 systemd 收集。每个请求只输出一行 JSON，`log` 不再添加时间戳前缀，采集器可以直接按行解析。字段固定为：
+所有日志写入 stderr，由 systemd 收集。每个请求只输出一行 JSON，`log` 不再添加时间戳前缀，采集器可以直接按行解析。
+
+日志有两种模式：
+
+- **默认（脱敏）**：JSON body 和 `authorization_token` 中的 `Puid` 只保留前 4 个字符（如 `"0123***"`），`Username`、`HostName`、`TrueHostName`、`PlayerName`、`FriendCode` 整段替换为 `"***"`（字段名不区分大小写），其他字段保留；非 JSON body（例如 `/api/user` 返回的 token）只记录 `[redacted: N bytes non-JSON]`；超过 16KB 的 body 只记录 `[omitted: N bytes]`，响应也最多缓存 16KB。脱敏后重新编码的 JSON 字段按字母顺序排列。
+- **`-debug`**：请求和响应 body 原样记录，`authorization_token` 为完整解码结果，内容见下方说明。只在排查问题时临时开启。
+
+字段固定为：
 
 | 字段 | 含义 |
 |---|---|
@@ -172,20 +190,26 @@ sudo nginx -t && sudo systemctl reload nginx
 | `method` / `path` / `query` | 请求方法、路径、原始查询参数 |
 | `user_agent` | 请求的 User-Agent |
 | `request_content_type` | 请求的 Content-Type |
-| `request_body` | 正常请求的完整请求体；超限或读取失败时仅记录已读取部分，见下方限制说明 |
-| `authorization_token` | Authorization 中的 token 经 Base64 解码后的 JSON，包含 `Content.ClientVersion`、`Puid` 等；没有 token 或无法解码时省略。解码不代表签名或身份已验证 |
+| `request_body` | 请求体；默认脱敏，`-debug` 时为完整内容（超限或读取失败时仅记录已读取部分，见下方限制说明） |
+| `authorization_token` | Authorization 中的 token 经 Base64 解码后的 JSON，包含 `Content.ClientVersion`、`Puid` 等；默认脱敏 `Puid`。没有 token 或无法解码时省略。解码不代表签名或身份已验证 |
 | `status` | 响应状态码 |
 | `response_content_type` | 响应的 Content-Type |
-| `response_body` | 完整响应体 |
+| `response_body` | 响应体；默认脱敏，`-debug` 时为完整内容 |
 | `duration_ms` | 从读取请求体到写完响应的耗时（毫秒） |
 
-示例：
+默认模式示例：
+
+```json
+{"time":"2026-10-18T16:02:21.123+08:00","client_ip":"203.0.113.9","peer":"127.0.0.1:54321","method":"POST","path":"/api/user","query":"","user_agent":"AmongUs/...","request_content_type":"application/json","request_body":"{\"ClientVersion\":50595550,\"Puid\":\"0123***\"}","status":200,"response_content_type":"text/plain; charset=utf-8","response_body":"[redacted: 152 bytes non-JSON]","duration_ms":12}
+```
+
+`-debug` 模式示例：
 
 ```json
 {"time":"2026-10-18T16:02:21.123+08:00","client_ip":"203.0.113.9","peer":"127.0.0.1:54321","method":"POST","path":"/api/user","query":"","user_agent":"AmongUs/...","request_content_type":"application/json","request_body":"{\"Puid\":\"...\",\"ClientVersion\":50595550}","status":200,"response_content_type":"text/plain; charset=utf-8","response_body":"eyJDb250ZW50...","duration_ms":12}
 ```
 
-后续创建或加入房间的请求携带 token 时，同一行中还会出现以下字段（节选）：
+后续创建或加入房间的请求携带 token 时，同一行中还会出现以下字段（`-debug` 模式，节选；默认模式下 `Puid` 为脱敏值）：
 
 ```json
 "authorization_token":{"Content":{"Puid":"...","ClientVersion":50663600,"ExpiresAt":"2012-12-21T00:00:00"},"Hash":"impostor_was_here"}
@@ -197,11 +221,11 @@ sudo nginx -t && sudo systemctl reload nginx
 sudo journalctl -u gopostor -f -o cat
 ```
 
-请求 body 上限为 64KB（65536 字节），在日志读取阶段生效；超限返回 HTTP 413，读取失败返回 HTTP 400，均不会进入业务处理。正常请求完整记录 body；超限请求只记录前 64KB，读取失败只记录已收到的部分，错误响应也记录在同一行日志中。
+请求 body 上限为 64KB（65536 字节），在日志读取阶段生效；超限返回 HTTP 413，读取失败返回 HTTP 400，均不会进入业务处理。`-debug` 模式下正常请求完整记录 body，超限请求只记录前 64KB，读取失败只记录已收到的部分；默认模式下这些 body 按上面的脱敏规则处理。错误响应也记录在同一行日志中。
 
-二进制 body 会作为字符串写入 JSON，例如单字节 `0x00` 显示为 `"\u0000"`，表示读到了一个空字节。它不是空 body；任意非 UTF-8 字节在 JSON 编码时可能被替换，因此此字段不保证无损还原所有二进制数据。版本信息通常在 Authorization token 中，查看 `authorization_token.Content.ClientVersion`，无需依赖 body。
+`-debug` 模式下二进制 body 会作为字符串写入 JSON，例如单字节 `0x00` 显示为 `"\u0000"`，表示读到了一个空字节。它不是空 body；任意非 UTF-8 字节在 JSON 编码时可能被替换，因此此字段不保证无损还原所有二进制数据。版本信息通常在 Authorization token 中，查看 `authorization_token.Content.ClientVersion`，无需依赖 body。
 
-> **安全警告**：请求和响应 body 会原样写入日志。`/api/user` 的响应 body 就是 token，请求 body 可能包含 `Puid`、`Username`；日志文件因此属于敏感数据，必须限制读取权限。大房间列表和高请求量仍会增加内存和磁盘压力。
+> **安全警告**：`-debug` 模式下请求和响应 body 会原样写入日志。`/api/user` 的响应 body 就是 token，请求 body 可能包含 `Puid`、`Username`；这时日志文件属于敏感数据，必须限制读取权限，排查完成后去掉 `-debug` 重启。完整记录大房间列表也会增加内存和磁盘压力。默认模式仍会记录客户端 IP 和脱敏后的 Puid 前缀，日志依然应限制读取权限。
 
 配置成功、后端列表、健康状态变化、统计汇总、warn-once 提示都不再单独输出日志；后端状态仍可通过 `/healthz` 查看。请求在进入 Go handler 之前失败（例如 HTTP 解析错误）不会被记录，后端 UDP 握手也不会记录。
 
@@ -215,7 +239,7 @@ go vet ./...
 go test -race ./...   # 需要 CGO，通常在 Linux/CI 上执行
 ```
 
-默认测试可在单独克隆的本仓库中运行，读取提交的 `config.example.json`，不依赖本地实际配置或外部 Impostor 源码。测试包含本地模拟后端、token 原始 JSON 格式与往返、宽松字段、各版本范围与回退路由、+25 标志、负数房间码、地址改写、创建探测、后端错误清理、1.9.x 缺失接口、健康检查、访问日志字段、请求体大小边界和读取错误、解码后的 Authorization token。仓库的 GitHub Actions 会执行 `gofmt`、`go vet`、`go test -race` 和 `go build`。
+默认测试可在单独克隆的本仓库中运行，读取提交的 `config.example.json`，不依赖本地实际配置或外部 Impostor 源码。测试包含本地模拟后端、token 原始 JSON 格式与往返、宽松字段、各版本范围与回退路由、+25 标志、负数房间码、地址改写、创建探测、后端错误清理、1.9.x 缺失接口、健康检查与失败阈值、访问日志字段与脱敏、请求体大小边界和读取错误、解码后的 Authorization token、启动与优雅退出。仓库的 GitHub Actions 会在 Go 1.26 和 1.27 上执行 `gofmt`、`go vet`、`go test -race` 和 `go build`。
 
 `parseTokenVersion` 还有一个 fuzz 目标：
 

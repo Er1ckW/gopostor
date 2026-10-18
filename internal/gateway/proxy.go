@@ -22,12 +22,24 @@ var errRedirect = errors.New("backend redirect refused")
 
 var errInvalidPayload = errors.New("invalid backend payload")
 
+// errServerStatus 表示后端返回了 5xx。连接虽然成功，但健康状态要按失败记录。
+var errServerStatus = errors.New("backend server error")
+
+// serverStatusError 在状态码为 5xx 时返回包装了 errServerStatus 的错误，否则返回 nil。
+func serverStatusError(status int) error {
+	if status >= 500 {
+		return fmt.Errorf("%w: status %d", errServerStatus, status)
+	}
+	return nil
+}
+
 // failureKind 是健康状态里保存的失败分类。
 type failureKind string
 
 const (
 	kindRedirect          failureKind = "redirect_refused"
 	kindInvalidPayload    failureKind = "invalid_payload"
+	kindServerStatus      failureKind = "server_error"
 	kindTimeout           failureKind = "timeout"
 	kindDNS               failureKind = "dns_error"
 	kindConnectionRefused failureKind = "connection_refused"
@@ -42,6 +54,9 @@ func classifyError(err error) failureKind {
 	}
 	if errors.Is(err, errInvalidPayload) {
 		return kindInvalidPayload
+	}
+	if errors.Is(err, errServerStatus) {
+		return kindServerStatus
 	}
 	var timeout net.Error
 	if errors.As(err, &timeout) && timeout.Timeout() {
@@ -88,7 +103,13 @@ func (g *gateway) sendBackendRequest(r *http.Request, b *Backend, method, target
 	defer response.Body.Close()
 
 	data, err := io.ReadAll(io.LimitReader(response.Body, 8<<20))
-	g.health.record(b, err, time.Since(start))
+	// 健康状态：读取失败或后端返回 5xx 都算失败；返回给调用方的 err 只代表网络/读取错误，
+	// 5xx 响应仍交给调用方按普通错误响应处理。
+	healthErr := err
+	if healthErr == nil {
+		healthErr = serverStatusError(response.StatusCode)
+	}
+	g.health.record(b, healthErr, time.Since(start))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -102,25 +123,30 @@ func (g *gateway) backendFailure(w http.ResponseWriter, isGameLookup bool) {
 
 // serveCreateGame 处理 PUT /api/games（创建房间）。
 // 网关返回配置中的公网地址，而不是后端自报的地址。
+//
+// 探测时后端如果返回了 Impostor 格式的错误（Errors[].Reason，例如版本不匹配），
+// 和查询类接口一样把 Reason 透传给客户端，玩家才能看到真实原因；
+// 其他失败（连不上、超时、非 2xx 且没有 Reason、内容无效）统一返回 502。
 func (g *gateway) serveCreateGame(w http.ResponseWriter, r *http.Request, b *Backend) {
 	if g.config.ProbeBackendOnCreate {
 		response, data, err := g.sendBackendRequest(r, b, http.MethodPut, "/api/games")
-		if err == nil && (response.StatusCode < 200 || response.StatusCode >= 300) {
-			err = fmt.Errorf("%w: status %d", errInvalidPayload, response.StatusCode)
-		}
-		var host struct{ Ip, Port json.Number }
-		if err == nil {
-			decoder := json.NewDecoder(bytes.NewReader(data))
-			decoder.UseNumber()
-			if decodeErr := decoder.Decode(&host); decodeErr != nil || host.Ip == "" || host.Port == "" {
-				err = fmt.Errorf("%w: host server", errInvalidPayload)
-			}
-		}
 		if err != nil {
-			if response != nil {
-				writeGameErrorResponse(w, false, 502, reasonError, "Matchmaking backend unavailable")
+			g.backendFailure(w, false)
+			return
+		}
+		if response.StatusCode < 200 || response.StatusCode >= 300 {
+			status := response.StatusCode
+			if reasons := parseBackendErrors(data); len(reasons) > 0 && status >= 400 {
+				writeJSON(w, status, errorBody(false, reasons...))
 				return
 			}
+			g.backendFailure(w, false)
+			return
+		}
+		var host struct{ Ip, Port json.Number }
+		decoder := json.NewDecoder(bytes.NewReader(data))
+		decoder.UseNumber()
+		if decodeErr := decoder.Decode(&host); decodeErr != nil || host.Ip == "" || host.Port == "" {
 			g.backendFailure(w, false)
 			return
 		}

@@ -4,9 +4,12 @@
 // 解码后的 Authorization token、响应状态/Content-Type/body、耗时。不再记录 issues、hint、route、
 // backend_stage、warn-once、统计汇总等诊断信息。
 //
-// 注意：请求 body 和响应 body 会原样写入日志。对于 /api/user，响应 body
-// 就是 token，请求 body 可能包含 Puid/Username，因此日志文件属于敏感数据，
-// 必须限制访问权限。
+// 日志有两种模式：
+//   - 默认：body 和 token 经过脱敏（见 redact.go），不记录完整的 Puid、玩家名字和 token，
+//     超过 16KB 的 body 只记录长度；
+//   - -debug：请求 body 和响应 body 原样写入日志。对于 /api/user，响应 body
+//     就是 token，请求 body 可能包含 Puid/Username，因此这时日志文件属于敏感数据，
+//     必须限制访问权限，排查完问题后应去掉 -debug 重启。
 package gateway
 
 import (
@@ -49,11 +52,16 @@ type accessLog struct {
 	DurationMS          int64           `json:"duration_ms"`
 }
 
-// loggingResponseWriter 包装真正的 ResponseWriter，记录状态码和完整响应 body。
+// loggingResponseWriter 包装真正的 ResponseWriter，记录状态码和响应 body。
+//
+// limit 小于 0 表示缓存完整响应（debug 模式）；否则只缓存前 limit 字节，
+// size 始终记录真实写出的总字节数。
 type loggingResponseWriter struct {
 	http.ResponseWriter
 	status int
 	body   bytes.Buffer
+	size   int
+	limit  int
 }
 
 // WriteHeader 只接受第一次写入的状态码，并转发给底层 ResponseWriter。
@@ -72,7 +80,13 @@ func (w *loggingResponseWriter) Write(p []byte) (int, error) {
 	}
 	n, err := w.ResponseWriter.Write(p)
 	// 只记录真正写出的部分，避免底层写失败时日志与客户端收到的内容不一致。
-	w.body.Write(p[:n])
+	written := p[:n]
+	w.size += n
+	if w.limit >= 0 {
+		// 非 debug 模式只缓存前 limit 字节；超出的部分不再占用内存。
+		written = written[:min(len(written), max(w.limit-w.body.Len(), 0))]
+	}
+	w.body.Write(written)
 	return n, err
 }
 
@@ -137,12 +151,15 @@ func forwardedClient(r *http.Request) string {
 //  1. 读取并恢复请求 body；
 //  2. 用 loggingResponseWriter 记录响应状态和 body；
 //  3. 调用 g.serve 处理业务；
-//  4. 请求结束后输出一行 JSON。
+//  4. 请求结束后输出一行 JSON；非 debug 模式下先对 body 和 token 脱敏。
 func (g *gateway) logRequests() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		requestBody, readErr := readRequestBody(w, r)
-		lrw := &loggingResponseWriter{ResponseWriter: w}
+		lrw := &loggingResponseWriter{ResponseWriter: w, limit: maxRedactedBodyBytes}
+		if g.debug {
+			lrw.limit = -1
+		}
 
 		// 即使业务处理 panic，也先写下这条访问日志；panic 随后仍由 net/http 处理。
 		defer func() {
@@ -166,6 +183,15 @@ func (g *gateway) logRequests() http.Handler {
 			}
 			if payload, err := decodeTokenPayload(r.Header.Get("Authorization")); err == nil {
 				entry.AuthorizationToken = payload
+			}
+			if !g.debug {
+				entry.RequestBody = redactBody([]byte(requestBody), len(requestBody))
+				entry.ResponseBody = redactBody(lrw.body.Bytes(), lrw.size)
+				if len(entry.AuthorizationToken) > 0 {
+					// decodeTokenPayload 已保证是合法 JSON，脱敏不会失败；万一失败就整段省略。
+					redacted, _ := redactJSON(entry.AuthorizationToken)
+					entry.AuthorizationToken = redacted
+				}
 			}
 			data, _ := json.Marshal(entry)
 			log.Print(string(data))

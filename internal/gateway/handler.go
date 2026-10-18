@@ -23,6 +23,8 @@ type gateway struct {
 	config *Config
 	client *http.Client
 	health *healthMonitor
+	// debug 为 true 时访问日志记录完整数据；默认 false，只记录脱敏后的内容。
+	debug bool
 }
 
 // newGateway 创建后端 HTTP 客户端，并组装 gateway。

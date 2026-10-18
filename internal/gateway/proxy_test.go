@@ -33,6 +33,8 @@ func TestClassifyError(t *testing.T) {
 		{"redirect", errRedirect, kindRedirect},
 		// %w 把 errInvalidPayload 包进新错误；errors.Is 仍能识别出内层哨兵。
 		{"wrapped invalid payload", fmt.Errorf("probe: %w", errInvalidPayload), kindInvalidPayload},
+		// 后端返回 5xx。
+		{"server status", serverStatusError(503), kindServerStatus},
 		// context.DeadlineExceeded 满足 net.Error 接口，Timeout() 返回 true。
 		{"timeout", context.DeadlineExceeded, kindTimeout},
 		// *net.DNSError 表示主机名解析失败。

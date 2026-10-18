@@ -196,6 +196,15 @@ func TestCreateProbe(t *testing.T) {
 	if w := call(newHandler(testConfig(t, broken.URL)), "PUT", "/api/games", "", auth); w.Code != 502 {
 		t.Fatal(w.Code)
 	}
+	// 后端返回 Impostor 格式的错误原因：和查询接口一样透传 Reason，丢弃 Message。
+	rejected := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(400)
+		_, _ = io.WriteString(w, `{"Errors":[{"Reason":5,"Message":"Exception at Impostor.Server"}]}`)
+	}))
+	defer rejected.Close()
+	if w := call(newHandler(testConfig(t, rejected.URL)), "PUT", "/api/games", "", auth); w.Code != 400 || w.Body.String() != `{"Errors":[{"Reason":5}]}`+"\n" {
+		t.Fatal(w.Code, w.Body.String())
+	}
 	// 后端自报 0.0.0.1:1，与配置不一致；网关只记录警告，仍返回配置地址。
 	mismatch := testConfig(t, hostBackend(t, 1, 1).URL)
 	if w := call(newHandler(mismatch), "PUT", "/api/games", "", auth); w.Code != 200 || !strings.Contains(w.Body.String(), `"Ip":16777343,"Port":22032`) {
@@ -366,6 +375,57 @@ func TestHealthz(t *testing.T) {
 	g.health.checkAll(context.Background())
 	if w := call(g.handler(), "GET", "/healthz", "", ""); w.Code != 503 || !strings.Contains(w.Body.String(), `"state":"down"`) {
 		t.Fatal(w.Code, w.Body.String())
+	}
+}
+
+// TestHealthThreshold 验证已经 up 的后端要连续失败 threshold 次才判 down，
+// 5xx 计为失败，成功一次立即恢复。
+func TestHealthThreshold(t *testing.T) {
+	c := testConfig(t, "http://127.0.0.1:1")
+	m := newHealthMonitor(&c, nil)
+	b := &c.Backends[0]
+	state := func() backendState { states, _ := m.snapshot(); return states[0] }
+
+	// unknown 时第一次失败直接判 down（从来没成功过）。
+	m.record(b, serverStatusError(500), 0)
+	if s := state(); s.State != stateDown || s.LastError != string(kindServerStatus) {
+		t.Fatalf("%+v", s)
+	}
+	m.record(b, nil, 0)
+	if s := state(); s.State != stateUp || s.Failures != 0 {
+		t.Fatalf("%+v", s)
+	}
+	// up 之后前两次失败仍是 up，第三次（默认阈值 3）才判 down。
+	for i := 1; i <= 3; i++ {
+		m.record(b, errInvalidPayload, 0)
+		if want := map[bool]string{true: stateDown, false: stateUp}[i == 3]; state().State != want {
+			t.Fatalf("after %d failures: %+v", i, state())
+		}
+	}
+}
+
+// TestHealthCountsServerErrors 验证后台检查和真实请求遇到 5xx 都记为失败，4xx 仍算可达。
+func TestHealthCountsServerErrors(t *testing.T) {
+	status := 503
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(status) }))
+	defer upstream.Close()
+	g := newGateway(testConfig(t, upstream.URL))
+	g.health.checkAll(context.Background())
+	if states, healthy := g.health.snapshot(); healthy || states[1].LastError != string(kindServerStatus) {
+		t.Fatalf("%+v", states)
+	}
+	status = 404
+	g.health.checkAll(context.Background())
+	if _, healthy := g.health.snapshot(); !healthy {
+		t.Fatal("404 must count as reachable")
+	}
+	// 真实请求收到 5xx：连续 3 次后判 down。
+	status = 500
+	for range 3 {
+		call(g.handler(), "GET", "/api/games", "", "Bearer "+createToken("test", 50663600))
+	}
+	if states, healthy := g.health.snapshot(); healthy || states[1].Failures != 3 {
+		t.Fatalf("%+v", states)
 	}
 }
 

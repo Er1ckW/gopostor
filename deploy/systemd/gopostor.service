@@ -10,6 +10,8 @@ Type=exec
 User=gopostor
 Group=gopostor
 WorkingDirectory=/opt/gopostor
+# 排查问题时可在末尾加 -debug：访问日志会记录完整的请求/响应 body 和 token（敏感），
+# 默认只记录脱敏后的内容。排查完成后务必去掉 -debug 再重启。
 ExecStart=/opt/gopostor/gopostor -config /opt/gopostor/config.json
 Restart=on-failure
 RestartSec=5
@@ -19,6 +21,29 @@ StandardError=journal
 SyslogIdentifier=gopostor
 NoNewPrivileges=true
 PrivateTmp=true
+# 以下为沙箱加固：gopostor 只需要读取 /opt/gopostor 并监听非特权端口，不写任何文件。
+ProtectSystem=strict
+ProtectHome=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target

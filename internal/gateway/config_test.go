@@ -221,7 +221,8 @@ func TestConfigValidation(t *testing.T) {
 	}
 	// 在示例配置上逐项制造非法配置：范围重叠、端口 0、IPv6、
 	// httpEndpoint 带路径、后端重名。每一项都必须被拒绝。
-	for _, pair := range [][2]string{{`"2024.3.1"`, `"2024.2.3"`}, {`22031`, `0`}, {`"127.0.0.1"`, `"::1"`}, {`"http://127.0.0.1:23001"`, `"http://localhost/path"`}, {`"1.10.9"`, `"1.9.3"`}} {
+	// 以及后端超时超过 Nginx 能等的上限、健康失败阈值为 0。
+	for _, pair := range [][2]string{{`"2024.3.1"`, `"2024.2.3"`}, {`22031`, `0`}, {`"127.0.0.1"`, `"::1"`}, {`"http://127.0.0.1:23001"`, `"http://localhost/path"`}, {`"1.10.9"`, `"1.9.3"`}, {`"backendTimeoutMs": 5000`, `"backendTimeoutMs": 10001`}, {`"healthCheckIntervalSec": 30`, `"healthCheckIntervalSec": 30, "healthFailureThreshold": 0`}} {
 		modified := strings.ReplaceAll(string(data), pair[0], pair[1])
 		// 先确认替换真的匹配到了内容，否则测试会因为"没改到"而误判通过。
 		if modified == string(data) {

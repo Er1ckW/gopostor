@@ -165,6 +165,7 @@ sudo nginx -t && sudo systemctl reload nginx
 | `user_agent` | 请求的 User-Agent |
 | `request_content_type` | 请求的 Content-Type |
 | `request_body` | 完整请求体 |
+| `authorization_token` | Authorization 中的 token 经 Base64 解码后的 JSON，包含 `Content.ClientVersion`、`Puid` 等；没有 token 或无法解码时省略。解码不代表签名或身份已验证 |
 | `status` | 响应状态码 |
 | `response_content_type` | 响应的 Content-Type |
 | `response_body` | 完整响应体 |
@@ -182,7 +183,9 @@ sudo nginx -t && sudo systemctl reload nginx
 sudo journalctl -u gopostor -f -o cat
 ```
 
-> **安全警告**：请求和响应 body 会原样写入日志。`/api/user` 的响应 body 就是 token，请求 body 可能包含 `Puid`、`Username`；日志文件因此属于敏感数据，必须限制读取权限。当前实现不限制 body 大小，超大请求或大房间列表会造成内存和磁盘压力；生产环境应增加上限，或只在临时调试时保留 body。
+请求 body 上限为 64KB（65536 字节），在日志读取阶段生效；超限返回 HTTP 413，读取失败返回 HTTP 400，均不会进入业务处理。正常请求完整记录 body；超限请求只记录前 64KB，读取失败只记录已收到的部分，错误响应也记录在同一行日志中。
+
+> **安全警告**：请求和响应 body 会原样写入日志。`/api/user` 的响应 body 就是 token，请求 body 可能包含 `Puid`、`Username`；日志文件因此属于敏感数据，必须限制读取权限。大房间列表和高请求量仍会增加内存和磁盘压力。
 
 配置成功、后端列表、健康状态变化、统计汇总、warn-once 提示都不再单独输出日志；后端状态仍可通过 `/healthz` 查看。请求在进入 Go handler 之前失败（例如 HTTP 解析错误）不会被记录，后端 UDP 握手也不会记录。
 

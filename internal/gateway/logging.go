@@ -1,7 +1,7 @@
 // 本文件只做一件事：为每个 HTTP 请求输出一行简单的访问日志。
 //
 // 日志字段固定为：时间、来源、请求方法/路径/查询参数/UA、请求 body、
-// 响应状态/Content-Type/body、耗时。不再记录 issues、hint、route、
+// 解码后的 Authorization token、响应状态/Content-Type/body、耗时。不再记录 issues、hint、route、
 // backend_stage、warn-once、统计汇总等诊断信息。
 //
 // 注意：请求 body 和响应 body 会原样写入日志。对于 /api/user，响应 body
@@ -14,6 +14,7 @@ import (
 	"bytes"
 	// encoding/json 把访问记录序列化成一行 JSON。
 	"encoding/json"
+	"errors"
 	// io 读取请求 body。
 	"io"
 	// log 输出最终的一行日志。
@@ -32,19 +33,20 @@ import (
 
 // accessLog 是每请求唯一的一条日志记录。
 type accessLog struct {
-	Time                string `json:"time"`
-	ClientIP            string `json:"client_ip"`
-	Peer                string `json:"peer"`
-	Method              string `json:"method"`
-	Path                string `json:"path"`
-	Query               string `json:"query"`
-	UserAgent           string `json:"user_agent"`
-	RequestContentType  string `json:"request_content_type"`
-	RequestBody         string `json:"request_body"`
-	Status              int    `json:"status"`
-	ResponseContentType string `json:"response_content_type"`
-	ResponseBody        string `json:"response_body"`
-	DurationMS          int64  `json:"duration_ms"`
+	Time                string          `json:"time"`
+	ClientIP            string          `json:"client_ip"`
+	Peer                string          `json:"peer"`
+	Method              string          `json:"method"`
+	Path                string          `json:"path"`
+	Query               string          `json:"query"`
+	UserAgent           string          `json:"user_agent"`
+	RequestContentType  string          `json:"request_content_type"`
+	RequestBody         string          `json:"request_body"`
+	AuthorizationToken  json.RawMessage `json:"authorization_token,omitempty"`
+	Status              int             `json:"status"`
+	ResponseContentType string          `json:"response_content_type"`
+	ResponseBody        string          `json:"response_body"`
+	DurationMS          int64           `json:"duration_ms"`
 }
 
 // loggingResponseWriter 包装真正的 ResponseWriter，记录状态码和完整响应 body。
@@ -77,19 +79,22 @@ func (w *loggingResponseWriter) Write(p []byte) (int, error) {
 // Unwrap 让 http.ResponseController 能拿到底层 ResponseWriter。
 func (w *loggingResponseWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
-// readRequestBody 读取完整请求 body，并把读到的内容重新放回 r.Body，
-// 保证后续业务代码仍然能正常读取。
-//
-// 这里故意不限制大小：调用方要求记录完整 body。代价是超大请求会占用内存，
-// 生产环境应根据可接受的日志体积增加上限。
-func readRequestBody(r *http.Request) string {
+const maxRequestBodyBytes = 64 << 10
+
+// readRequestBody 最多读取 64KB；成功时恢复 body，失败时由调用方拒绝请求。
+// 失败请求的日志只保留已读取的部分，避免为了记日志而继续读取超大 body。
+func readRequestBody(w http.ResponseWriter, r *http.Request) (string, error) {
 	if r.Body == nil {
-		return ""
+		return "", nil
 	}
-	data, _ := io.ReadAll(r.Body)
-	_ = r.Body.Close()
+	body := http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
+	data, err := io.ReadAll(body)
+	_ = body.Close()
+	if err != nil {
+		return string(data), err
+	}
 	r.Body = io.NopCloser(bytes.NewReader(data))
-	return string(data)
+	return string(data), nil
 }
 
 // clientIP 返回日志中的 client_ip：优先使用可信代理传来的真实 IP，
@@ -136,7 +141,7 @@ func forwardedClient(r *http.Request) string {
 func (g *gateway) logRequests() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		requestBody := readRequestBody(r)
+		requestBody, readErr := readRequestBody(w, r)
 		lrw := &loggingResponseWriter{ResponseWriter: w}
 
 		// 即使业务处理 panic，也先写下这条访问日志；panic 随后仍由 net/http 处理。
@@ -159,10 +164,23 @@ func (g *gateway) logRequests() http.Handler {
 				ResponseBody:        lrw.body.String(),
 				DurationMS:          time.Since(start).Milliseconds(),
 			}
+			if payload, err := decodeTokenPayload(r.Header.Get("Authorization")); err == nil {
+				entry.AuthorizationToken = payload
+			}
 			data, _ := json.Marshal(entry)
 			log.Print(string(data))
 		}()
 
+		if readErr != nil {
+			status, message := http.StatusBadRequest, "Invalid request body"
+			var tooLarge *http.MaxBytesError
+			if errors.As(readErr, &tooLarge) {
+				status, message = http.StatusRequestEntityTooLarge, "Request body exceeds 64KB"
+			}
+			isGameLookup := strings.HasPrefix(r.URL.Path, "/api/games/") && r.URL.Path != "/api/games/filtered"
+			writeGameErrorResponse(lrw, isGameLookup, status, reasonError, message)
+			return
+		}
 		g.serve(lrw, r)
 	})
 }

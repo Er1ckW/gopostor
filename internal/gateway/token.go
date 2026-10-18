@@ -44,14 +44,7 @@ var bearerPattern = regexp.MustCompile(`(?i)^Bearer\s+([A-Za-z0-9+/]+={0,2})$`)
 // parseTokenVersion 从 Authorization 头中读出客户端版本。
 // 只要求 ClientVersion 合法；不校验 Puid 和 Hash。
 func parseTokenVersion(header string) (int64, error) {
-	if strings.TrimSpace(header) == "" {
-		return 0, fmt.Errorf("missing token")
-	}
-	m := bearerPattern.FindStringSubmatch(strings.TrimSpace(header))
-	if m == nil || len(m[1]) > 16384 {
-		return 0, fmt.Errorf("invalid token")
-	}
-	data, err := base64.StdEncoding.Strict().DecodeString(m[1])
+	data, err := decodeTokenPayload(header)
 	if err != nil {
 		return 0, err
 	}
@@ -66,6 +59,25 @@ func parseTokenVersion(header string) (int64, error) {
 		return 0, fmt.Errorf("invalid token payload")
 	}
 	return version, nil
+}
+
+// decodeTokenPayload 供路由解析和访问日志共用，保持相同的格式与长度限制。
+func decodeTokenPayload(header string) ([]byte, error) {
+	if strings.TrimSpace(header) == "" {
+		return nil, fmt.Errorf("missing token")
+	}
+	m := bearerPattern.FindStringSubmatch(strings.TrimSpace(header))
+	if m == nil || len(m[1]) > 16384 {
+		return nil, fmt.Errorf("invalid token")
+	}
+	data, err := base64.StdEncoding.Strict().DecodeString(m[1])
+	if err != nil {
+		return nil, err
+	}
+	if !json.Valid(data) {
+		return nil, fmt.Errorf("invalid token JSON")
+	}
+	return data, nil
 }
 
 // flexibleInt 接受 JSON 数字或数字字符串，返回解析出的整数和是否成功。
@@ -102,7 +114,7 @@ func (g *gateway) serveToken(w http.ResponseWriter, r *http.Request) {
 		ClientVersion json.RawMessage
 	}
 
-	data, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 65536))
+	data, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxRequestBodyBytes))
 	if err != nil {
 		writeErrorResponse(w, 400, reasonError, "Invalid token request")
 		return
